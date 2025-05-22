@@ -1,0 +1,9 @@
+carla==0.9.13
+pygame==2.5.2
+numpy==1.23.0
+shapely==2.0.7
+networkx==3.1
+pandas==2.0.3
+casadi==3.7.0
+matplotlib==3.7.5
+PyYAML==0.17.32

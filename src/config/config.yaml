@@ -1,0 +1,28 @@
+MPCController:
+  N: 50         # Prediction horizon
+  dt: 0.1                # Time step duration (seconds)
+  ref_v: 50/3.6              # Reference velocity (m/s) - ~43.2 km/h
+  a_max: 4.0              # Maximum acceleration (m/s^2)
+  steer_max_deg: 25       # Maximum steering angle in degrees
+  v_max: 16              # Maximum allowed velocity in city
+
+  # Cost function weights
+  weights:
+    cte: 10          # Cross-Track Error weight
+    epsi: 300      # Orientation Error weight
+    v: 700           # Velocity error weight
+    delta: 1.0            # Steering actuation weight
+    a: 5              # Acceleration actuation weight
+    diff_delta: 200    # Sequential steering change weight
+    diff_a: 250           # Sequential acceleration change weight
+
+  # Fuel consumption coefficients
+  fuel_consumption:
+    b0: 0.1569             # Fuel cruise constant b0
+    b1: 0.02450            # Fuel cruise constant b1 (2.450e-2)
+    b2: -0.0007415         # Fuel cruise constant b2 (-7.415e-4)
+    b3: 0.00005975         # Fuel cruise constant b3 (5.975e-5)
+    c0: 0.07224            # Fuel acceleration constant c0
+    c1: 0.09681            # Fuel acceleration constant c1 (9.681e-2)
+    c2: 0.001075            # Fuel acceleration constant c2 (1.075e-3)
+    F_idle: 0.1            # Idling fuel consumption constant
