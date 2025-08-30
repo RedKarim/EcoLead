@@ -36,13 +36,19 @@
 import carla
 import numpy as np
 import os
-from mpc_controller import MPCController # importing the MPC controller
+# from mpc_controller import MPCController # importing the MPC controller - DISABLED for distributed MPC
 import math
 from ego_model import EgoModel
 import csv
 from datetime import datetime
 import utils
 import yaml
+import json
+import time
+import threading
+
+# MQTT client for distributed MPC
+import paho.mqtt.client as mqtt
 
 
 def get_waypoints(waypoints_list, N, vehicle_x, vehicle_y, vehicle_psi, current_wp_idx):
@@ -219,13 +225,81 @@ class MPCAgent(object):
         
         # Initialize the EGO model
         self.ego_model = EgoModel(self.dt)
-        # Initializing the MPC controller
-        self.mpc_controller = MPCController(self.ego_model,mpc_config,weights,fuel_coeffs)
+        # DISTRIBUTED MPC: Initialize MQTT instead of local MPC controller
+        self.setup_distributed_mpc()
         # Read waypoints from CSV. For Standalone mode, seperate calling.
         # Read waypoints from CSV. For Standalone mode, seperate calling.
         self.waypoints = utils.read_waypoints_from_csv("config/route.csv")
         self.waypoint_locations = [carla.Location(x=wp['x'], y=wp['y'], z=wp['z']) for wp in self.waypoints]
         self.current_wp_idx = 0  # Initialize current waypoint index
+
+    def setup_distributed_mpc(self, mqtt_broker='10.21.89.202', mqtt_port=1883):
+        """Setup MQTT for distributed MPC communication"""
+        try:
+            if hasattr(mqtt, 'CallbackAPIVersion'):
+                self.mqtt_client = mqtt.Client(client_id="mpc_agent", callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+            else:
+                self.mqtt_client = mqtt.Client(client_id="mpc_agent")
+        except Exception as e:
+            print(f"[MQTT] Client creation error: {e}")
+            self.mqtt_client = mqtt.Client(client_id="mpc_agent")
+        
+        self.mqtt_client.on_connect = self.on_mqtt_connect
+        self.mqtt_client.on_message = self.on_mqtt_message
+        
+        # MPC result data
+        self.latest_mpc_result = None
+        self.result_lock = threading.Lock()
+        self.result_received = False
+        
+        try:
+            self.mqtt_client.connect(mqtt_broker, mqtt_port, 60)
+            self.mqtt_client.loop_start()
+            print(f"[MQTT] Connected to distributed MPC controller at {mqtt_broker}:{mqtt_port}")
+        except Exception as e:
+            print(f"[MQTT] Connection failed: {e}")
+
+    def on_mqtt_connect(self, client, userdata, flags, rc):
+        """MQTT connection callback"""
+        if rc == 0:
+            print("[MQTT] Successfully connected to broker")
+            # Subscribe to MPC results from distributed controller
+            client.subscribe("mpc/result")
+            print("[MQTT] Subscribed to mpc/result")
+        else:
+            print(f"[MQTT] Failed to connect, return code {rc}")
+
+    def on_mqtt_message(self, client, userdata, msg):
+        """MQTT message received callback"""
+        try:
+            topic = msg.topic
+            payload = json.loads(msg.payload.decode())
+            
+            if topic == "mpc/result":
+                with self.result_lock:
+                    self.latest_mpc_result = payload
+                    self.result_received = True
+                print(f"[DEBUG] Received MPC result")
+                
+        except Exception as e:
+            print(f"[MQTT] Message processing error: {e}")
+
+    def send_mpc_request(self, state, coeffs, prev_delta, prev_a, ref_v):
+        """Send MPC request to distributed controller"""
+        try:
+            request_msg = {
+                'timestamp': time.time(),
+                'state': [float(s) for s in state],
+                'coeffs': [float(c) for c in coeffs],
+                'prev_delta': float(prev_delta),
+                'prev_a': float(prev_a),
+                'ref_v': float(ref_v)
+            }
+            
+            self.mqtt_client.publish("mpc/request", json.dumps(request_msg), qos=1)
+            print(f"[DEBUG] Sent MPC request")
+        except Exception as e:
+            print(f"[MQTT] Failed to send request: {e}")
 
     def get_vehicle_state(self):
         """
@@ -349,8 +423,33 @@ class MPCAgent(object):
         # Define the initial state for MPC
         current_state = np.array([pred_x, pred_y, pred_psi, pred_v, pred_cte, pred_epsi])
         print("Min Acceleration: ", min(calculated_acceleration, self.prev_a))
-        # Solve MPC to obtain the optimal delta and acceleration
-        optimal_delta, optimal_a, mpc_x, mpc_y = self.mpc_controller.solve(current_state, coeffs, self.prev_delta, self.prev_a, self.ref_v)
+        
+        # DISTRIBUTED MPC: Send request to Mac and wait for result
+        self.send_mpc_request(current_state, coeffs, self.prev_delta, self.prev_a, self.ref_v)
+        
+        # Wait for MPC result with timeout
+        timeout = 0.5  # 500ms timeout
+        start_time = time.time()
+        while not self.result_received and (time.time() - start_time) < timeout:
+            time.sleep(0.001)  # 1ms sleep
+        
+        if self.result_received:
+            with self.result_lock:
+                result = self.latest_mpc_result.copy()
+                self.result_received = False
+            
+            optimal_delta = result['optimal_delta']
+            optimal_a = result['optimal_a']
+            mpc_x = result['mpc_x']
+            mpc_y = result['mpc_y']
+            print(f"[MPC] Received distributed result: delta={optimal_delta:.3f}, a[0]={optimal_a[0]:.3f}")
+        else:
+            print("[MPC] Timeout waiting for distributed MPC result, using fallback")
+            # Fallback to safe control
+            optimal_delta = 0.0
+            optimal_a = [0.0] * (self.N - 1)
+            mpc_x = [0.0] * self.N
+            mpc_y = [0.0] * self.N
 
         # Update for next timestep
         self.prev_delta = optimal_delta
@@ -359,8 +458,8 @@ class MPCAgent(object):
 
         # Map acceleration to throttle and brake
         throttle_cmd, brake_cmd = map_acceleration_to_throttle_brake(optimal_a[0], 
-                                                                     self.mpc_controller.a_max, 
-                                                                     -self.mpc_controller.a_max, 
+                                                                     self.a_max, 
+                                                                     -self.a_max, 
                                                                      should_brake=False)
         
         # Compute the steering command
