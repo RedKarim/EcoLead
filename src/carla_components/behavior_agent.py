@@ -3,6 +3,7 @@
 #
 # Copyright (c) 2025, FZI Forschungszentrum Informatik
 # Copyright (c) 2018-2020, Computer Vision Center (CVC), Universitat Autonoma de Barcelona
+# Copyright (c) 2025, MAHDYAR KARIMI
 #
 # Redistribution and use in source and binary forms, with or without modification, are permitted
 # provided that the following conditions are met:
@@ -23,6 +24,7 @@
 # IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 # IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
 # OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+# Modified by: MAHDYAR KARIMI, 2025-08-31
 # -- END LICENSE BLOCK ------------------------------------------------
 
 
@@ -661,9 +663,13 @@ class BehaviorAgent(BasicAgent):
             control = self._local_planner.run_step(debug=debug)
             return control
         # 1: Red lights and stops behavior
-        if self.traffic_light_manager():
-            # print("[BEHAVIOUR AGENT] Traffic Light_manager emergency stop")
-            return self.emergency_stop()
+        # Check if there's a red light ahead using the traffic light manager
+        if hasattr(self, '_traffic_light_manager') and self._traffic_light_manager:
+            vehicle_location = self._vehicle.get_location()
+            is_red_ahead, tl_id = self._traffic_light_manager.is_red_light_ahead(vehicle_location)
+            if is_red_ahead:
+                print(f"[BEHAVIOUR AGENT] Red light ahead (TL {tl_id}), emergency stop!")
+                return self.emergency_stop()
 
         # 2.2: Car following behaviors
         # print(f"My Distance:{distance}")
