@@ -20,11 +20,11 @@ class IDMAgent:
     """
     
     # IDM parameters (aggressive settings for urban driving)
-    DESIRED_TIME_GAP = 1.2      # 希望時間間隔 (s)
-    DESIRED_VELOCITY = 16       # 希望速度 (m/s)
-    MIN_SPACING = 2             # 最小車間距離 (m)
-    MAX_ACCELERATION = 2.0      # 最大加速度 (m/s²)
-    COMFORTABLE_DECEL = 2.0     # 快適減速度 (m/s²)
+    DESIRED_TIME_GAP = 1.3      # 希望時間間隔 (s)
+    DESIRED_VELOCITY = 17       # 希望速度 (m/s)
+    MIN_SPACING = 0.5           # 最小車間距離 (m)
+    MAX_ACCELERATION = 2.5      # 最大加速度 (m/s²)
+    COMFORTABLE_DECEL = 2.5     # 快適減速度 (m/s²)
     VEHICLE_LENGTH = 1.5        # 車長 (m) - IDMと合わせる
     
     # Control parameters
