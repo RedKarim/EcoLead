@@ -1,6 +1,7 @@
 # -- BEGIN LICENSE BLOCK ----------------------------------------------
 # Copyright (c) 2025, FZI Forschungszentrum Informatik
-#
+# Copyright (c) 2025, MAHDYAR KARIMI
+# 
 # Redistribution and use in source and binary forms, with or without modification, are permitted
 # provided that the following conditions are met:
 #
@@ -30,13 +31,14 @@
 # \author  Melih Yazgan <yazgan@fzi.de>
 # \date    2025-05-24
 #
-#
+# Modified by: MAHDYAR KARIMI, 2025-08-31
 # ---------------------------------------------------------------------
 
 import carla
 import pygame
 import math
 import yaml
+import sys
 from mpc_agent import MPCAgent
 from camera_manager import CameraManager
 from display_manager import DisplayManager
@@ -44,9 +46,24 @@ from traffic_light_manager import TrafficLightManager
 from traffic_manager import VehicleTrafficManager
 import utils
 from pid_agent import PIDAgent
+from idm_agent import IDMAgent
 
 
 def main():
+    # コマンドライン引数をチェック
+    if len(sys.argv) != 2:
+        print("Usage: python3 main.py [MPC|IDM]")
+        print("  MPC: Run with MPC controller and platoon scenario")
+        print("  IDM: Run with IDM controller, ego vehicle only")
+        sys.exit(1)
+    
+    mode = sys.argv[1].upper()
+    if mode not in ['MPC', 'IDM']:
+        print("Error: Mode must be either 'MPC' or 'IDM'")
+        sys.exit(1)
+    
+    print(f"Running simulation in {mode} mode")
+    
     pygame.init()
     clock = pygame.time.Clock()
     display_size = (800, 600)
@@ -113,18 +130,29 @@ def main():
         # Initialize Traffic Light Manager
         traffic_light_manager = TrafficLightManager(client, traffic_lights_settings, waypoints)
 
-        # Initialize the traffic manager with the waypoints and seed
-        scenario = 'packleader'  # Choose between 'packleader', 'following'
-        behavior = 'normal'  # Choose between 'normal', 'aggressive', or 'cautious'
-        ego_vehicle_controller = 'mpc'  # Choose between 'mpc' or 'pid'
-        vehicle_traffic_manager = VehicleTrafficManager(
-            client, world, transforms, scenario, behavior, ego_vehicle, 
-            traffic_light_manager, num_behind=7, num_vehicles=3, spacing=36, 
-            front_vehicle_autopilot=False
-        )
-
-        # Parameterize scenario choice
-        vehicle_traffic_manager.spawn_scenario()
+        # モードに基づいてシナリオとコントローラーを設定
+        if mode == 'MPC':
+            scenario = 'packleader'  # MPC mode: full platoon scenario
+            ego_vehicle_controller = 'mpc'
+            behavior = 'normal'
+            vehicle_traffic_manager = VehicleTrafficManager(
+                client, world, transforms, scenario, behavior, ego_vehicle, 
+                traffic_light_manager, num_behind=7, num_vehicles=3, spacing=36, 
+                front_vehicle_autopilot=False
+            )
+            # Spawn platoon scenario
+            vehicle_traffic_manager.spawn_scenario()
+        else:  # IDM mode
+            scenario = 'idm_packleader'  # IDM mode: ego vehicle with followers
+            ego_vehicle_controller = 'idm'
+            behavior = 'normal'
+            vehicle_traffic_manager = VehicleTrafficManager(
+                client, world, transforms, scenario, behavior, ego_vehicle, 
+                traffic_light_manager, num_behind=7, num_vehicles=3, spacing=36, 
+                front_vehicle_autopilot=False
+            )
+            # Spawn IDM scenario with following vehicles
+            vehicle_traffic_manager.spawn_idm_scenario()
 
         # Initialize camera manager
         camera_manager = CameraManager(ego_vehicle, display_size)
@@ -140,7 +168,9 @@ def main():
          # Initialize the ego vehicle Controller agent
         if ego_vehicle_controller == 'pid':
             ego_agent = PIDAgent(ego_vehicle, transforms, behavior)
-        else:
+        elif ego_vehicle_controller == 'idm':
+            ego_agent = IDMAgent(ego_vehicle, transforms)
+        else:  # mpc
             ego_agent = MPCAgent(ego_vehicle, config)
 
         total_distance = 0
@@ -176,13 +206,43 @@ def main():
                 ego_vehicle.apply_control(control)
                 # Testing
                 optimal_a = 1.0
-            else:
+                ref_v = speed
+                ref_v_mpc = speed
+            elif ego_vehicle_controller == 'idm':
+                # IDMモード：信号機状態を更新してIDMエージェントで制御 + フォロワー車両管理
+                if scenario == 'idm_packleader':
+                    # IDM ego + following vehicles scenario
+                    optimal_a, ref_v, ref_v_mpc = vehicle_traffic_manager.update_idm_pack(ego_agent, current_tick)
+                    
+                    # Check if all platoons are completed
+                    if not vehicle_traffic_manager.platoon_managers:
+                        print("[Main] All platoons completed in IDM mode, ending simulation")
+                        break  # Exit the main simulation loop
+                else:
+                    # IDM ego only scenario
+                    ego_location = ego_vehicle.get_location()
+                    traffic_light_manager.update_traffic_lights(ego_location, current_tick)
+                    optimal_a, route_end, target_speed = ego_agent.on_tick(traffic_light_manager)
+                    ref_v = speed  # 現在の速度を参照速度として使用
+                    ref_v_mpc = target_speed
+                    
+                    # Check if route is completed for single IDM vehicle
+                    if route_end:
+                        print("[Main] IDM route completed, ending simulation")
+                        break  # Exit the main simulation loop
+            else:  # MPC mode
                 if scenario == 'packleader':
                 # Update all platoons through their respective PlatoonManager instances
                     optimal_a, ref_v,ref_v_mpc =vehicle_traffic_manager.update_pack(ego_agent,current_tick)
+                    
+                    # Check if all platoons are completed (same logic as IDM)
+                    if not vehicle_traffic_manager.platoon_managers:
+                        print("[Main] All platoons completed in MPC mode, ending simulation")
+                        break  # Exit the main simulation loop
                 else:
                     print("No Scenario just ego vehicle with MPC...")
-                    traffic_light_manager.update_traffic_lights(ego_vehicle, current_tick)
+                    ego_location = ego_vehicle.get_location()
+                    traffic_light_manager.update_traffic_lights(ego_location, current_tick)
                     ref_v, _, _ = traffic_light_manager.calculate_reference_velocity(speed)
                     optimal_a = ego_agent.on_tick(ref_v)
             
