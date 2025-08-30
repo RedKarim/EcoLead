@@ -4,3 +4,5 @@ src/__pycache__
 src/carla_components/__pycache__
 src/vehicle*.csv
 src/MPC_results*.csv
+
+*.env
