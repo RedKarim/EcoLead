@@ -1,6 +1,7 @@
 # -- BEGIN LICENSE BLOCK ----------------------------------------------
 # Copyright (c) 2025, FZI Forschungszentrum Informatik
-#
+# Copyright (c) 2025, MAHDYAR KARIMI
+# 
 # Redistribution and use in source and binary forms, with or without modification, are permitted
 # provided that the following conditions are met:
 #
@@ -30,7 +31,7 @@
 # \author  Melih Yazgan <yazgan@fzi.de>
 # \date    2025-05-24
 #
-#
+# Modified by: MAHDYAR KARIMI, 2025-08-31
 # ---------------------------------------------------------------------
 
 import csv
@@ -126,8 +127,24 @@ class VehicleTrafficManager:
             platoon_manager = PlatoonManager(vehicles=vehicles_list, leader_id=self.ego_vehicle.id, traffic_manager=self)
             self.platoon_managers.append(platoon_manager)
 
+        elif self.scenario == 'idm_packleader':
+            self.spawn_idm_pack()
+            # Initialize platoon for IDM packleader (similar to MPC packleader)
+            vehicles_list = [self.ego_vehicle] + [v['vehicle'] for v in self.behind_vehicles]
+            platoon_manager = PlatoonManager(vehicles=vehicles_list, leader_id=self.ego_vehicle.id, traffic_manager=self, behaviour_agents=self.behind_vehicles, platoon_id=1)
+            self.platoon_managers.append(platoon_manager)
+            self.traffic_light_manager.set_platoon_manager(platoon_manager)
         else:
             print(f"Unknown scenario: {self.scenario}")
+
+    def spawn_idm_scenario(self):
+        """Spawn IDM scenario with following vehicles."""
+        self.spawn_scenario()  # Use existing spawn logic
+
+    def spawn_idm_pack(self):
+        """Spawn vehicles behind the ego vehicle for IDM pack leader scenario."""
+        # Use the same logic as spawn_pack
+        self.spawn_pack()
 
     def spawn_pack(self):
         """Spawn vehicles behind the ego vehicle as pack leader scenario."""
@@ -269,6 +286,115 @@ class VehicleTrafficManager:
             if platoon_status["mode"]=="SPLIT":
                 self.platoon_managers.append(platoon_status["sub_platoon"])
         return optimal_a,ref_v,ref_v_mpc
+
+    def update_idm_pack(self, ego_agent, current_tick):
+        """Update status and control for behind vehicles in IDM mode."""
+        route_end = False
+        optimal_a = 0
+        ref_v_mpc = 0
+        
+        for platoon_manager in self.platoon_managers:
+            leader = False
+            idm_agent = False
+            print("---------Update IDM PACK-------------")
+            self.traffic_light_manager.set_platoon_manager(platoon_manager)
+            print(f"[Traffic Manager IDM] Updating Platoon ID: {platoon_manager.platoon_id}")
+            distances = [100]  # Leader has no front vehicles
+            
+            # For IDM mode, the ego vehicle uses IDM agent, followers use CACC/PID
+            if platoon_manager.platoon_id == 1:  # Main platoon with IDM leader
+                idm_agent = True
+                
+                # Update traffic lights for ego vehicle (IDM agent)
+                ego_location = self.ego_vehicle.get_location()
+                print(f"[Traffic Manager IDM] Updating traffic lights for ego vehicle at location ({ego_location.x:.1f}, {ego_location.y:.1f})")
+                self.traffic_light_manager.update_traffic_lights(ego_location, current_tick)
+                
+                ego_velocity = self.ego_vehicle.get_velocity()
+                ego_speed = math.sqrt(ego_velocity.x**2 + ego_velocity.y**2)  # m/s
+                
+                # IDM agent handles its own traffic light logic
+                optimal_a, route_end, idm_target_speed = ego_agent.on_tick(self.traffic_light_manager)
+                ref_v = ego_speed  # Use current ego speed as reference for followers
+                ref_v_mpc = idm_target_speed  # Use IDM target speed for MPC reference
+                
+                # Platoon status for IDM (compatible with platoon_manager.update_platoon)
+                platoon_status = {
+                    "mode": "STABLE", 
+                    "velocity": ref_v,
+                    "front_group": [platoon_manager.pam.vehicle_ids],
+                    "rear_group": [],
+                    "sub_platoon": None
+                }
+                tl_id = 13  # Default traffic light
+                eta_to_light = 100  # Default ETA
+            
+            # Update following vehicles (each with individual traffic light calculations)
+            for i, vehicle_data in enumerate(platoon_manager.behind_vehicles):
+                vehicle = vehicle_data['vehicle']
+                agent = vehicle_data['agent']
+                following_vehicle = vehicle_data['following']
+                id = vehicle_data['id']
+                
+                # Update traffic lights for this specific follower vehicle
+                follower_location = vehicle.get_location()
+                print(f"[Traffic Manager IDM] Updating traffic lights for follower {id} at location ({follower_location.x:.1f}, {follower_location.y:.1f})")
+                self.traffic_light_manager.update_traffic_lights(follower_location, current_tick)
+                
+                if not vehicle.is_alive:
+                    continue
+                
+                # Calculate distance to the following vehicle
+                if platoon_manager.leader_id == id:
+                    # If the vehicle is the leader (ego), skip control (IDM agent handles it)
+                    distance_to_packleader = 100
+                    distance = following_vehicle.get_location().distance(vehicle.get_location())
+                    leader = True
+                    following_vehicle_speed = ego_speed
+                    continue  # Skip control application for ego vehicle
+                else:
+                    distance = following_vehicle.get_location().distance(vehicle.get_location())
+                    following_vehicle_velocity = following_vehicle.get_velocity()
+                    following_vehicle_speed = math.sqrt(following_vehicle_velocity.x**2 + following_vehicle_velocity.y**2)
+                    distance_to_packleader = platoon_manager.traffic_manager.ego_vehicle.get_location().distance(vehicle.get_location())
+                    distances.append(distance)
+                
+                velocity = vehicle.get_velocity()
+                absolute_velocity = math.sqrt(velocity.x**2 + velocity.y**2)
+                timestamp = self.world.get_snapshot().timestamp.elapsed_seconds
+                print(f"[Traffic Manager IDM] Behind_{i+1}: Distance to following vehicle: {distance:.2f}, Vehicle Velocity: {absolute_velocity:.2f}, Following Vehicle Velocity: {following_vehicle_speed:.2f}, Ref V: {ref_v} m/s")
+                
+                # Write to CSV
+                csv_file = self.csv_files.get(f'velocity_{id}')
+                if csv_file:
+                    writer = csv.writer(csv_file)
+                    writer.writerow([timestamp, absolute_velocity, platoon_manager.platoon_id, ref_v, distance])
+                
+                # Update agent speed limit to match ego vehicle's speed
+                agent._update_information(ego_vehicle_speed=ref_v*3.6)
+                
+                # Pass traffic light manager to behavior agent
+                agent._traffic_light_manager = self.traffic_light_manager
+                
+                # Apply CACC/PID control for following vehicles
+                control = agent.run_step(following_vehicle, distance, distance_to_packleader, following_vehicle_speed, leader, debug=True)
+                leader = False
+                vehicle.apply_control(control)
+            
+            # Update platoon status
+            platoon_manager.update_platoon(platoon_status, tl_id, ref_v, eta_to_light, distances=distances)
+            
+            # Handle route completion (same as MPC mode)
+            if route_end:
+                print("[Traffic Manager IDM] Route completed, removing platoon manager")
+                route_end = False
+                self.platoon_managers.pop(0)
+                # If no more platoons, the simulation should end
+                if not self.platoon_managers:
+                    print("[Traffic Manager IDM] All platoons completed, simulation ending")
+                    break  # Exit the platoon loop
+            
+        return optimal_a, ref_v, ref_v_mpc
     
     def spawn_following_scenario(self):
         """Spawn a front vehicle and random traffic for the following scenario."""
