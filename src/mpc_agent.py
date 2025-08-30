@@ -46,6 +46,9 @@ import yaml
 import json
 import time
 import threading
+from collections import deque
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 
 # MQTT client for distributed MPC
 import paho.mqtt.client as mqtt
@@ -232,6 +235,170 @@ class MPCAgent(object):
         self.waypoints = utils.read_waypoints_from_csv("config/route.csv")
         self.waypoint_locations = [carla.Location(x=wp['x'], y=wp['y'], z=wp['z']) for wp in self.waypoints]
         self.current_wp_idx = 0  # Initialize current waypoint index
+        
+        # MQTT Performance Metrics
+        self.setup_mqtt_metrics()
+
+    def setup_mqtt_metrics(self):
+        """Setup MQTT performance metrics tracking"""
+        # Packet tracking
+        self.sent_packets = {}  # {packet_id: timestamp}
+        self.packet_counter = 0
+        self.metrics_lock = threading.Lock()
+        
+        # Performance metrics storage
+        self.latency_history = deque(maxlen=1000)  # Keep last 1000 measurements
+        self.packet_loss_history = deque(maxlen=1000)
+        self.time_history = deque(maxlen=1000)
+        
+        # Current metrics
+        self.current_latency = 0.0
+        self.current_packet_loss = 0.0
+        self.total_sent = 0
+        self.total_received = 0
+        self.total_lost = 0
+        
+        # CSV logging
+        self.metrics_csv_file = f"mqtt_metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.init_csv_file()
+        
+        # Real-time plotting
+        self.setup_realtime_plot()
+        
+        # Cleanup thread for old packets (consider lost after 5 seconds)
+        self.cleanup_thread = threading.Thread(target=self.cleanup_old_packets, daemon=True)
+        self.cleanup_thread.start()
+        
+        print("[MQTT Metrics] Performance tracking initialized")
+
+    def init_csv_file(self):
+        """Initialize CSV file for metrics logging"""
+        try:
+            with open(self.metrics_csv_file, 'w', newline='') as csvfile:
+                fieldnames = [
+                    'timestamp', 'packet_id', 'latency_ms', 'packet_loss_percent',
+                    'total_sent', 'total_received', 'total_lost'
+                ]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+            print(f"[MQTT Metrics] CSV file initialized: {self.metrics_csv_file}")
+        except Exception as e:
+            print(f"[MQTT Metrics] Error initializing CSV: {e}")
+
+    def setup_realtime_plot(self):
+        """Setup real-time matplotlib visualization"""
+        try:
+            # Create figure with subplots
+            self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(12, 8))
+            self.fig.suptitle('MQTT Performance Metrics - Real Time')
+            
+            # Latency plot
+            self.ax1.set_title('Round Trip Latency (ms)')
+            self.ax1.set_ylabel('Latency (ms)')
+            self.ax1.grid(True)
+            self.ax1.set_ylim(0, 200)  # Adjust based on expected latency
+            
+            # Packet loss plot
+            self.ax2.set_title('Packet Loss (%)')
+            self.ax2.set_xlabel('Time (s)')
+            self.ax2.set_ylabel('Packet Loss (%)')
+            self.ax2.grid(True)
+            self.ax2.set_ylim(0, 100)
+            
+            # Initialize empty line plots
+            self.latency_line, = self.ax1.plot([], [], 'b-', linewidth=2, label='Latency')
+            self.packet_loss_line, = self.ax2.plot([], [], 'r-', linewidth=2, label='Packet Loss')
+            
+            self.ax1.legend()
+            self.ax2.legend()
+            
+            # Start animation
+            self.anim = animation.FuncAnimation(
+                self.fig, self.update_plot, interval=100, blit=False
+            )
+            
+            # Show plot in non-blocking mode
+            plt.ion()
+            plt.show(block=False)
+            
+            print("[MQTT Metrics] Real-time plot initialized")
+        except Exception as e:
+            print(f"[MQTT Metrics] Error setting up plot: {e}")
+            self.fig = None
+
+    def update_plot(self, frame):
+        """Update the real-time plot"""
+        try:
+            with self.metrics_lock:
+                if len(self.time_history) > 0:
+                    # Update latency plot
+                    self.latency_line.set_data(list(self.time_history), list(self.latency_history))
+                    self.ax1.set_xlim(min(self.time_history), max(self.time_history))
+                    
+                    # Update packet loss plot
+                    self.packet_loss_line.set_data(list(self.time_history), list(self.packet_loss_history))
+                    self.ax2.set_xlim(min(self.time_history), max(self.time_history))
+                    
+                    # Update titles with current values
+                    self.ax1.set_title(f'Round Trip Latency: {self.current_latency:.1f} ms (Avg: {np.mean(list(self.latency_history)):.1f} ms)')
+                    self.ax2.set_title(f'Packet Loss: {self.current_packet_loss:.1f}% (Total: {self.total_sent} sent, {self.total_lost} lost)')
+                    
+            return self.latency_line, self.packet_loss_line
+        except Exception as e:
+            print(f"[MQTT Metrics] Plot update error: {e}")
+            return self.latency_line, self.packet_loss_line
+
+    def cleanup_old_packets(self):
+        """Background thread to clean up old packets (consider them lost)"""
+        while True:
+            try:
+                current_time = time.time()
+                timeout = 5.0  # 5 seconds timeout
+                
+                with self.metrics_lock:
+                    expired_packets = []
+                    for packet_id, timestamp in self.sent_packets.items():
+                        if current_time - timestamp > timeout:
+                            expired_packets.append(packet_id)
+                    
+                    # Remove expired packets and count as lost
+                    for packet_id in expired_packets:
+                        del self.sent_packets[packet_id]
+                        self.total_lost += 1
+                        self.update_packet_loss_metrics()
+                
+                time.sleep(1.0)  # Check every second
+            except Exception as e:
+                print(f"[MQTT Metrics] Cleanup thread error: {e}")
+                time.sleep(1.0)
+
+    def update_packet_loss_metrics(self):
+        """Update packet loss percentage"""
+        if self.total_sent > 0:
+            self.current_packet_loss = (self.total_lost / self.total_sent) * 100.0
+        else:
+            self.current_packet_loss = 0.0
+
+    def log_metrics_to_csv(self, packet_id, latency_ms):
+        """Log metrics to CSV file"""
+        try:
+            with open(self.metrics_csv_file, 'a', newline='') as csvfile:
+                fieldnames = [
+                    'timestamp', 'packet_id', 'latency_ms', 'packet_loss_percent',
+                    'total_sent', 'total_received', 'total_lost'
+                ]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writerow({
+                    'timestamp': datetime.now().isoformat(),
+                    'packet_id': packet_id,
+                    'latency_ms': latency_ms,
+                    'packet_loss_percent': self.current_packet_loss,
+                    'total_sent': self.total_sent,
+                    'total_received': self.total_received,
+                    'total_lost': self.total_lost
+                })
+        except Exception as e:
+            print(f"[MQTT Metrics] CSV logging error: {e}")
 
     def setup_distributed_mpc(self, mqtt_broker='10.21.89.202', mqtt_port=1883):
         """Setup MQTT for distributed MPC communication"""
@@ -276,6 +443,41 @@ class MPCAgent(object):
             payload = json.loads(msg.payload.decode())
             
             if topic == "mpc/result":
+                # Extract packet tracking info
+                packet_id = payload.get('packet_id', None)
+                receive_time = time.time()
+                
+                # Calculate latency if packet ID exists
+                if packet_id is not None:
+                    with self.metrics_lock:
+                        if packet_id in self.sent_packets:
+                            # Calculate round-trip latency
+                            send_time = self.sent_packets[packet_id]
+                            latency_ms = (receive_time - send_time) * 1000.0
+                            
+                            # Update metrics
+                            self.total_received += 1
+                            self.current_latency = latency_ms
+                            
+                            # Store in history for plotting
+                            current_sim_time = receive_time - self.simulation_start_time if hasattr(self, 'simulation_start_time') else receive_time
+                            self.latency_history.append(latency_ms)
+                            self.packet_loss_history.append(self.current_packet_loss)
+                            self.time_history.append(current_sim_time)
+                            
+                            # Remove from sent packets (received successfully)
+                            del self.sent_packets[packet_id]
+                            
+                            # Update packet loss metrics
+                            self.update_packet_loss_metrics()
+                            
+                            # Log to CSV
+                            self.log_metrics_to_csv(packet_id, latency_ms)
+                            
+                            print(f"[MQTT Metrics] Packet {packet_id}: RTT = {latency_ms:.1f}ms, Loss = {self.current_packet_loss:.1f}%")
+                        else:
+                            print(f"[MQTT Metrics] Warning: Received unknown packet ID {packet_id}")
+                
                 with self.result_lock:
                     self.latest_mpc_result = payload
                     self.result_received = True
@@ -285,10 +487,25 @@ class MPCAgent(object):
             print(f"[MQTT] Message processing error: {e}")
 
     def send_mpc_request(self, state, coeffs, prev_delta, prev_a, ref_v):
-        """Send MPC request to distributed controller"""
+        """Send MPC request to distributed controller with packet tracking"""
         try:
+            # Generate unique packet ID
+            with self.metrics_lock:
+                self.packet_counter += 1
+                packet_id = self.packet_counter
+                send_time = time.time()
+                
+                # Store packet for tracking
+                self.sent_packets[packet_id] = send_time
+                self.total_sent += 1
+                
+                # Initialize simulation start time if not set
+                if not hasattr(self, 'simulation_start_time'):
+                    self.simulation_start_time = send_time
+            
             request_msg = {
-                'timestamp': time.time(),
+                'packet_id': packet_id,  # Add packet ID for tracking
+                'timestamp': send_time,
                 'state': [float(s) for s in state],
                 'coeffs': [float(c) for c in coeffs],
                 'prev_delta': float(prev_delta),
@@ -297,7 +514,7 @@ class MPCAgent(object):
             }
             
             self.mqtt_client.publish("mpc/request", json.dumps(request_msg), qos=1)
-            print(f"[DEBUG] Sent MPC request")
+            print(f"[DEBUG] Sent MPC request (Packet ID: {packet_id})")
         except Exception as e:
             print(f"[MQTT] Failed to send request: {e}")
 

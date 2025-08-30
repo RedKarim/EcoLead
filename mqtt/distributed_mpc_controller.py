@@ -123,15 +123,19 @@ class DistributedMPCController:
                 with self.request_lock:
                     self.latest_mpc_request = payload
                     self.request_received = True
-                print(f"[DEBUG] Received MPC request")
+                
+                # Log packet ID if present
+                packet_id = payload.get('packet_id', 'Unknown')
+                print(f"[DEBUG] Received MPC request (Packet ID: {packet_id})")
                 
         except Exception as e:
             print(f"[MQTT] Message processing error: {e}")
 
-    def publish_mpc_result(self, optimal_delta, optimal_a, mpc_x, mpc_y):
+    def publish_mpc_result(self, optimal_delta, optimal_a, mpc_x, mpc_y, packet_id=None):
         """Publish MPC result back to main simulation"""
         try:
             result_msg = {
+                'packet_id': packet_id,  # Echo back packet ID for tracking
                 'timestamp': time.time(),
                 'optimal_delta': float(optimal_delta),
                 'optimal_a': [float(a) for a in optimal_a],
@@ -140,7 +144,7 @@ class DistributedMPCController:
             }
             
             self.mqtt_client.publish("mpc/result", json.dumps(result_msg), qos=1)
-            print(f"[DEBUG] Published MPC result: delta={optimal_delta:.3f}, a[0]={optimal_a[0]:.3f}")
+            print(f"[DEBUG] Published MPC result (Packet ID: {packet_id}): delta={optimal_delta:.3f}, a[0]={optimal_a[0]:.3f}")
         except Exception as e:
             print(f"[MQTT] Failed to publish result: {e}")
 
@@ -323,6 +327,7 @@ class DistributedMPCController:
             
             try:
                 # Extract MPC request data
+                packet_id = request.get('packet_id', None)
                 state = request['state']
                 coeffs = request['coeffs']
                 prev_delta = request['prev_delta']
@@ -334,12 +339,12 @@ class DistributedMPCController:
                 
                 if result is not None:
                     optimal_delta, optimal_a, mpc_x, mpc_y = result
-                    # Send result back to main simulation
-                    self.publish_mpc_result(optimal_delta, optimal_a, mpc_x, mpc_y)
+                    # Send result back to main simulation with packet ID
+                    self.publish_mpc_result(optimal_delta, optimal_a, mpc_x, mpc_y, packet_id)
                 else:
                     print("[MPC] Solver failed, sending fallback result")
-                    # Send safe fallback
-                    self.publish_mpc_result(0.0, [0.0] * (self.N-1), [0.0] * self.N, [0.0] * self.N)
+                    # Send safe fallback with packet ID
+                    self.publish_mpc_result(0.0, [0.0] * (self.N-1), [0.0] * self.N, [0.0] * self.N, packet_id)
                     
             except Exception as e:
                 print(f"[MPC] Error processing request: {e}")
