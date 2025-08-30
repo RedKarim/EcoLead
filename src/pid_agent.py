@@ -1,6 +1,7 @@
 # -- BEGIN LICENSE BLOCK ----------------------------------------------
 # Copyright (c) 2025, FZI Forschungszentrum Informatik
-#
+# Copyright (c) 2025, MAHDYAR KARIMI
+# 
 # Redistribution and use in source and binary forms, with or without modification, are permitted
 # provided that the following conditions are met:
 #
@@ -30,6 +31,7 @@
 # \author  Melih Yazgan <yazgan@fzi.de>
 # \date    2025-05-24
 #
+# Modified by: MAHDYAR KARIMI, 2025-08-31
 #
 # ---------------------------------------------------------------------
 
@@ -91,7 +93,10 @@ class PIDAgent(BehaviorAgent):
         control = None
 
         # 1: Red lights and stops behavior
-        if self.traffic_light_manager():
+        vehicle_location = self._vehicle.get_location()
+        is_red_ahead, tl_id = traffic_light_manager.is_red_light_ahead(vehicle_location)
+        if is_red_ahead:
+            print(f"[PID Agent] Red light ahead (TL {tl_id}), emergency stop!")
             return self.emergency_stop()
 
         # 2: Car following behaviors
