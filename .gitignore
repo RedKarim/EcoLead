@@ -6,5 +6,6 @@ src/vehicle*.csv
 src/MPC_results*.csv
 
 *.env
+*.pem
 
 /certs
