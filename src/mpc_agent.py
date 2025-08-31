@@ -50,8 +50,24 @@ from collections import deque
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-# MQTT client for distributed MPC
+# AWS IoT MQTT client for Lambda MPC
 import paho.mqtt.client as mqtt
+import ssl
+from dotenv import load_dotenv
+
+# 環境変数をロード（複数のファイルを試行）
+env_files = ['.env', 'aws_config.env', 'windows_config.env', '../aws_config.env', '../windows_config.env']
+env_loaded = False
+
+for env_file in env_files:
+    if os.path.exists(env_file):
+        load_dotenv(env_file)
+        print(f"[ENV] Loaded environment from: {env_file}")
+        env_loaded = True
+        break
+
+if not env_loaded:
+    print("[ENV] Warning: No .env file found, using system environment variables")
 
 
 def get_waypoints(waypoints_list, N, vehicle_x, vehicle_y, vehicle_psi, current_wp_idx):
@@ -228,7 +244,7 @@ class MPCAgent(object):
         
         # Initialize the EGO model
         self.ego_model = EgoModel(self.dt)
-        # DISTRIBUTED MPC: Initialize MQTT instead of local MPC controller
+        # AWS LAMBDA MPC: Initialize AWS IoT instead of local MPC controller
         self.setup_distributed_mpc()
         # Read waypoints from CSV. For Standalone mode, seperate calling.
         # Read waypoints from CSV. For Standalone mode, seperate calling.
@@ -400,19 +416,87 @@ class MPCAgent(object):
         except Exception as e:
             print(f"[MQTT Metrics] CSV logging error: {e}")
 
-    def setup_distributed_mpc(self, mqtt_broker='10.21.89.202', mqtt_port=1883):
-        """Setup MQTT for distributed MPC communication"""
+    def setup_distributed_mpc(self):
+        """Setup AWS IoT for Lambda MPC communication"""
+        # AWS IoT設定を環境変数から読み込み
+        self.aws_endpoint = os.getenv("AWS_ENDPOINT")
+        self.client_id = os.getenv("CLIENT_ID", "mpc_agent") + "_mpc"
+        self.ca_path = os.getenv("AWS_CA_PATH")
+        self.cert_path = os.getenv("AWS_CERT_PATH") 
+        self.key_path = os.getenv("AWS_KEY_PATH")
+        
+        # デバッグ情報を表示
+        print(f"[AWS IoT] Environment variables:")
+        print(f"  AWS_ENDPOINT: {self.aws_endpoint}")
+        print(f"  CLIENT_ID: {os.getenv('CLIENT_ID')}")
+        print(f"  AWS_CA_PATH: {self.ca_path}")
+        print(f"  AWS_CERT_PATH: {self.cert_path}")
+        print(f"  AWS_KEY_PATH: {self.key_path}")
+        
+        if not all([self.aws_endpoint, self.ca_path, self.cert_path, self.key_path]):
+            missing = []
+            if not self.aws_endpoint: missing.append("AWS_ENDPOINT")
+            if not self.ca_path: missing.append("AWS_CA_PATH")
+            if not self.cert_path: missing.append("AWS_CERT_PATH")
+            if not self.key_path: missing.append("AWS_KEY_PATH")
+            
+            error_msg = f"Missing environment variables: {', '.join(missing)}"
+            print(f"[AWS IoT] Error: {error_msg}")
+            print("[AWS IoT] Please create a .env file with your AWS IoT credentials")
+            raise ValueError(f"AWS IoT credentials not properly configured: {error_msg}")
+        
+        # 証明書ファイルの存在確認とパス解決
+        cert_files = {
+            'CA': self.ca_path,
+            'Certificate': self.cert_path,
+            'Private Key': self.key_path
+        }
+        
+        for name, path in cert_files.items():
+            if not os.path.exists(path):
+                print(f"[AWS IoT] Warning: {name} file not found at: {path}")
+                # 絶対パスで再試行
+                abs_path = os.path.abspath(path)
+                print(f"[AWS IoT] Trying absolute path: {abs_path}")
+                if os.path.exists(abs_path):
+                    print(f"[AWS IoT] Found {name} file at absolute path")
+                    if name == 'CA':
+                        self.ca_path = abs_path
+                    elif name == 'Certificate':
+                        self.cert_path = abs_path
+                    elif name == 'Private Key':
+                        self.key_path = abs_path
+                else:
+                    print(f"[AWS IoT] Error: {name} file not found at {path} or {abs_path}")
+                    raise FileNotFoundError(f"Certificate file not found: {name} at {path}")
+            else:
+                print(f"[AWS IoT] Found {name} file: {path}")
+        
+        print(f"[AWS IoT] Final certificate paths:")
+        print(f"  CA: {self.ca_path}")
+        print(f"  Cert: {self.cert_path}")
+        print(f"  Key: {self.key_path}")
+        
         try:
             if hasattr(mqtt, 'CallbackAPIVersion'):
-                self.mqtt_client = mqtt.Client(client_id="mpc_agent", callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+                self.mqtt_client = mqtt.Client(client_id=self.client_id, callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
             else:
-                self.mqtt_client = mqtt.Client(client_id="mpc_agent")
+                self.mqtt_client = mqtt.Client(client_id=self.client_id)
         except Exception as e:
-            print(f"[MQTT] Client creation error: {e}")
-            self.mqtt_client = mqtt.Client(client_id="mpc_agent")
+            print(f"[AWS IoT] Client creation error: {e}")
+            self.mqtt_client = mqtt.Client(client_id=self.client_id)
         
         self.mqtt_client.on_connect = self.on_mqtt_connect
         self.mqtt_client.on_message = self.on_mqtt_message
+        self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+        
+        # TLS設定
+        self.mqtt_client.tls_set(
+            ca_certs=self.ca_path,
+            certfile=self.cert_path,
+            keyfile=self.key_path,
+            tls_version=ssl.PROTOCOL_TLSv1_2
+        )
         
         # MPC result data
         self.latest_mpc_result = None
@@ -420,21 +504,33 @@ class MPCAgent(object):
         self.result_received = False
         
         try:
-            self.mqtt_client.connect(mqtt_broker, mqtt_port, 60)
+            print(f"[AWS IoT] Connecting to {self.aws_endpoint}...")
+            self.mqtt_client.connect(self.aws_endpoint, 8883, 60)
             self.mqtt_client.loop_start()
-            print(f"[MQTT] Connected to distributed MPC controller at {mqtt_broker}:{mqtt_port}")
+            print(f"[AWS IoT] Connected to AWS IoT Core for Lambda MPC")
         except Exception as e:
-            print(f"[MQTT] Connection failed: {e}")
+            print(f"[AWS IoT] Connection failed: {e}")
+            raise
 
     def on_mqtt_connect(self, client, userdata, flags, rc):
-        """MQTT connection callback"""
+        """AWS IoT connection callback"""
         if rc == 0:
-            print("[MQTT] Successfully connected to broker")
-            # Subscribe to MPC results from distributed controller
-            client.subscribe("mpc/result")
-            print("[MQTT] Subscribed to mpc/result")
+            print("[AWS IoT] Successfully connected to AWS IoT Core")
+            # Subscribe to MPC results from Lambda function
+            client.subscribe("mpc/result", qos=1)
+            print("[AWS IoT] Subscribed to mpc/result")
         else:
-            print(f"[MQTT] Failed to connect, return code {rc}")
+            print(f"[AWS IoT] Failed to connect, return code {rc}")
+
+    def on_mqtt_disconnect(self, client, userdata, rc):
+        """AWS IoT disconnect callback"""
+        print(f"[AWS IoT] Disconnected with result code {rc}")
+        if rc != 0:
+            print("Unexpected disconnection. Attempting to reconnect...")
+            try:
+                client.reconnect()
+            except Exception as e:
+                print(f"Reconnection failed: {e}")
 
     def on_mqtt_message(self, client, userdata, msg):
         """MQTT message received callback"""
@@ -481,13 +577,13 @@ class MPCAgent(object):
                 with self.result_lock:
                     self.latest_mpc_result = payload
                     self.result_received = True
-                print(f"[DEBUG] Received MPC result")
+                print(f"[DEBUG] Received AWS Lambda MPC result")
                 
         except Exception as e:
-            print(f"[MQTT] Message processing error: {e}")
+            print(f"[AWS IoT] Message processing error: {e}")
 
     def send_mpc_request(self, state, coeffs, prev_delta, prev_a, ref_v):
-        """Send MPC request to distributed controller with packet tracking"""
+        """Send MPC request to AWS Lambda with packet tracking"""
         try:
             # Generate unique packet ID
             with self.metrics_lock:
@@ -513,10 +609,11 @@ class MPCAgent(object):
                 'ref_v': float(ref_v)
             }
             
+            # AWS IoT経由でリクエスト送信（Lambda関数をトリガー）
             self.mqtt_client.publish("mpc/request", json.dumps(request_msg), qos=1)
-            print(f"[DEBUG] Sent MPC request (Packet ID: {packet_id})")
+            print(f"[DEBUG] Sent AWS Lambda MPC request (Packet ID: {packet_id})")
         except Exception as e:
-            print(f"[MQTT] Failed to send request: {e}")
+            print(f"[AWS IoT] Failed to send request: {e}")
 
     def get_vehicle_state(self):
         """
@@ -641,11 +738,11 @@ class MPCAgent(object):
         current_state = np.array([pred_x, pred_y, pred_psi, pred_v, pred_cte, pred_epsi])
         print("Min Acceleration: ", min(calculated_acceleration, self.prev_a))
         
-        # DISTRIBUTED MPC: Send request to Mac and wait for result
+        # AWS LAMBDA MPC: Send request to AWS Lambda and wait for result
         self.send_mpc_request(current_state, coeffs, self.prev_delta, self.prev_a, self.ref_v)
         
-        # Wait for MPC result with timeout
-        timeout = 0.5  # 500ms timeout
+        # Wait for MPC result with timeout (longer for AWS Lambda)
+        timeout = 2.0  # 2 seconds timeout for AWS Lambda
         start_time = time.time()
         while not self.result_received and (time.time() - start_time) < timeout:
             time.sleep(0.001)  # 1ms sleep
@@ -659,9 +756,9 @@ class MPCAgent(object):
             optimal_a = result['optimal_a']
             mpc_x = result['mpc_x']
             mpc_y = result['mpc_y']
-            print(f"[MPC] Received distributed result: delta={optimal_delta:.3f}, a[0]={optimal_a[0]:.3f}")
+            print(f"[AWS MPC] Received Lambda result: delta={optimal_delta:.3f}, a[0]={optimal_a[0]:.3f}")
         else:
-            print("[MPC] Timeout waiting for distributed MPC result, using fallback")
+            print("[AWS MPC] Timeout waiting for Lambda MPC result, using fallback")
             # Fallback to safe control
             optimal_delta = 0.0
             optimal_a = [0.0] * (self.N - 1)
