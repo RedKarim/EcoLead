@@ -35,6 +35,7 @@
 
 import numpy as np
 import casadi as ca
+import time
 
 class MPCController:
     def __init__(self, ego_model, mpc_config, weights, fuel_coeffs):
@@ -180,6 +181,9 @@ class MPCController:
         print("Constraints set up successfully!")
 
     def solve(self, state, coeffs, prev_delta, prev_a, ref_v):
+        # 800ms latencyをシミュレート
+        time.sleep(0.8)
+        
         opti = ca.Opti()
 
         N = self.N
