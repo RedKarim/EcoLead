@@ -283,8 +283,13 @@ class VehicleTrafficManager:
             if route_end:
                 route_end = False
                 self.platoon_managers.pop(0)
-            if platoon_status["mode"]=="SPLIT":
-                self.platoon_managers.append(platoon_status["sub_platoon"])
+            
+            # レイテンシー対応: バッファから実行すべきスプリット決定を取得
+            import time
+            buffered_decision, should_execute = self.traffic_light_manager.split_decision_buffer.get_decision(time.time())
+            if should_execute and buffered_decision and buffered_decision.get("mode") == "SPLIT":
+                print(f"[Traffic Manager] バッファからスプリット決定を実行 (800ms遅延後)")
+                self.platoon_managers.append(buffered_decision["sub_platoon"])
         return optimal_a,ref_v,ref_v_mpc
 
     def update_idm_pack(self, ego_agent, current_tick):
