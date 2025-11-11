@@ -35,7 +35,9 @@
 
 import carla
 from platoon_manager import PlatoonManager
+from split_decision_buffer import SplitDecisionBuffer
 import math
+import time
 
 class TrafficLightManager:
     def __init__(self, client, traffic_lights_config, waypoint_locations):
@@ -58,6 +60,10 @@ class TrafficLightManager:
         self.processed_tl_ids = {}  # Dictionary keyed by platoon_id
         self.corridor_change = False
         self.pams = []
+        
+        # スプリット決定バッファ（レイテンシー対応）
+        self.split_decision_buffer = SplitDecisionBuffer(latency=0.8)
+        print("[TrafficLightManager] スプリット決定バッファ初期化: latency=800ms")
 
         # Deactivate other traffic lights
         self.deactivate_other_traffic_lights()
@@ -772,10 +778,20 @@ class TrafficLightManager:
         """
         Decide how to set self.ref_v and return the final dictionary.
         Also track the number of times we decided to split.
+        レイテンシー対応: スプリット決定をバッファに追加
         """
         mode = result["mode"]
         vel=result["velocity"]
-        print(f"[Finalize Split Decision] Ref Vel= {vel:.4f} m/s, Mode= {mode}.")
+        print(f"[Finalize Split Decision] Ref Vel= {vel:.4f} m/s, Mode= {mode}." if vel else f"[Finalize Split Decision] Ref Vel= None, Mode= {mode}.")
+        
+        # 現在時刻を取得
+        current_time = time.time()
+        
+        # スプリット決定をバッファに追加（レイテンシー分遅延）
+        if mode in ["SPLIT", "WAIT"]:
+            self.split_decision_buffer.add_decision(result, current_time)
+            print(f"[Finalize Split Decision] 決定をバッファに追加 (800ms遅延)")
+        
         if mode == "NONE":
             print("[Finalize Split Decision] No subplatoon can pass => fallback to v_min.")
             self.ref_v = self.v_min
@@ -787,14 +803,15 @@ class TrafficLightManager:
             return self.ref_v, result, traffic_light_key,eta_to_light
 
         if mode == "SPLIT":
-            # increment the split counter
             print(f"[Finalize Split Decision] SPLIT DECISION COUNT = {self.split_counter}")
             self.ref_v = result["velocity"]
+            # 実際のスプリットはバッファから取得して実行
             return self.ref_v, result, traffic_light_key,eta_to_light
         
         if mode == "WAIT":
             self.ref_v = result["velocity"]
             return self.ref_v, result, traffic_light_key,eta_to_light
+        
         # Should not happen, fallback
         self.ref_v = self.v_min
         return self.ref_v, result, traffic_light_key,eta_to_light
@@ -892,7 +909,12 @@ class TrafficLightManager:
             # Find other platoons in the same corridor
             for other_pam in self.pams:
                 # print(f"[CALC REF VEL] ETA to Light: {other_pam}")
-                if other_pam.platoon_id != platoon_id and other_pam.corridor_id == pam.corridor_id and (other_pam.eta_to_light < pam.eta_to_light):
+                # eta_to_lightがNoneの場合の処理を追加
+                if (other_pam.platoon_id != platoon_id and 
+                    other_pam.corridor_id == pam.corridor_id and 
+                    other_pam.eta_to_light is not None and 
+                    pam.eta_to_light is not None and 
+                    other_pam.eta_to_light < pam.eta_to_light):
                     print(f"[CALC REF VEL] Checking platoon {other_pam.platoon_id} in the same corridor.")
                     # Calculate distance between the two platoons, leader to leader
                     distance_to_other = math.sqrt(
@@ -965,8 +987,12 @@ class TrafficLightManager:
                     feasible_range=feasible_range,
                     v_saturation=v_saturation
                 )
-                eta_to_light = max(0.1,tl_data["distance"]/result["velocity"])
-                print(f"[CALC REF VEL] Partial split => Ref Vel= {result['velocity']:.4f} m/s.")
+                # result["velocity"]がNoneの場合の処理
+                if result["velocity"] is not None and result["velocity"] > 0:
+                    eta_to_light = max(0.1, tl_data["distance"] / result["velocity"])
+                else:
+                    eta_to_light = 1.0  # デフォルト値
+                print(f"[CALC REF VEL] Partial split => Ref Vel= {result['velocity']:.4f} m/s." if result["velocity"] else "[CALC REF VEL] Partial split => Ref Vel= None")
                 return self._finalize_split_decision(result, self.corridor_id,eta_to_light)
 
             else:
@@ -982,7 +1008,10 @@ class TrafficLightManager:
                     feasible_range=feasible_range,
                     v_saturation=v_saturation
                 )
-                eta_to_light = max(0.1,tl_data["distance"]/result["velocity"])
+                if result["velocity"] is not None and result["velocity"] > 0:
+                    eta_to_light = max(0.1, tl_data["distance"] / result["velocity"])
+                else:
+                    eta_to_light = 1.0
                 return self._finalize_split_decision(result, self.corridor_id,eta_to_light)
 
         # 5) If feasible_range is None => partial or none
@@ -996,7 +1025,10 @@ class TrafficLightManager:
             feasible_range=feasible_range,
             v_saturation=v_saturation
         )
-        eta_to_light = max(0.1,tl_data["distance"]/result["velocity"])
+        if result["velocity"] is not None and result["velocity"] > 0:
+            eta_to_light = max(0.1, tl_data["distance"] / result["velocity"])
+        else:
+            eta_to_light = 1.0
         return self._finalize_split_decision(result, self.corridor_id,eta_to_light)
 
     def is_red_light_ahead(self, vehicle_location):

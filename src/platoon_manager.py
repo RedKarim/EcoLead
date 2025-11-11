@@ -144,6 +144,20 @@ class PlatoonManager:
             new_platoon_manager.ego_vehicle = sub_platoon_behind_vehicles[0]
             platoon_position=new_platoon_manager.ego_vehicle["vehicle"].get_location()
             print(f"[PLATOON MANAGER] Platoon Created with Leader Ego: {rear_leader_id}")
+            
+            # 重要: 新プラトゥーンの車両のfollowing参照を更新
+            # リア車両間の追従関係を再構築
+            for i, vehicle_data in enumerate(sub_platoon_behind_vehicles):
+                if i == 0:
+                    # 最初の車両（リアプラトゥーンのリーダー）はフロントプラトゥーンの最後の車両を追う
+                    # しかし、スプリット後は独立したプラトゥーンなので、自分自身を参照
+                    vehicle_data['following'] = vehicle_data['vehicle']
+                    print(f"[PLATOON MANAGER] 新リーダー {vehicle_data['id']} は自分自身を追従")
+                else:
+                    # 他の車両は前の車両を追う
+                    vehicle_data['following'] = sub_platoon_behind_vehicles[i-1]['vehicle']
+                    print(f"[PLATOON MANAGER] 車両 {vehicle_data['id']} は {sub_platoon_behind_vehicles[i-1]['id']} を追従")
+            
             # Initialize PCM and PAM for the new platoon
             new_platoon_manager.pcms = sub_platoon_pcms
             for p,pcm in enumerate(new_platoon_manager.pcms):

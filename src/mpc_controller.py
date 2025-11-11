@@ -35,6 +35,8 @@
 
 import numpy as np
 import casadi as ca
+import time
+from control_buffer import ControlBuffer
 
 class MPCController:
     def __init__(self, ego_model, mpc_config, weights, fuel_coeffs):
@@ -46,6 +48,14 @@ class MPCController:
         steer_max_deg = mpc_config.get('steer_max_deg', 25)
         self.steer_max = np.deg2rad(steer_max_deg)
         self.v_max = mpc_config.get('v_max', 15.0)
+        
+        # レイテンシー対応設定
+        self.latency = mpc_config.get('latency', 0.8)  # デフォルト800ms
+        self.buffer_horizon = mpc_config.get('buffer_horizon', 8)  # バッファする制御ステップ数
+        self.control_buffer = ControlBuffer(buffer_size=max(20, self.buffer_horizon * 2), dt=self.dt)
+        
+        print(f"[MPC] レイテンシー対応モード: latency={self.latency*1000:.0f}ms, buffer_horizon={self.buffer_horizon}")
+        print(f"[MPC] 注意: レイテンシーはタイムスタンプオフセットでシミュレート（sleep不使用）")
 
         # Cost function weights
         self.weight_cte = weights.get('cte', 1.0)
@@ -179,7 +189,70 @@ class MPCController:
             opti.subject_to(epsi[t] == (psi_t1 - psi_des) + v_t1 * delta_t0 / (self.ego_model.front_wb + self.ego_model.rear_wb) * self.dt)
         print("Constraints set up successfully!")
 
-    def solve(self, state, coeffs, prev_delta, prev_a, ref_v):
+    def solve_sync(self, state, coeffs, prev_delta, prev_a, ref_v, current_time):
+        """
+        MPC計算を実行してバッファに保存（同期版）
+        レイテンシーはタイムスタンプのオフセットでシミュレート
+        """
+        result = self._solve_mpc(state, coeffs, prev_delta, prev_a, ref_v)
+        
+        if result is not None:
+            opt_delta, opt_a, mpc_x, mpc_y = result
+            # バッファに制御信号シーケンスを追加
+            # numpy配列からPythonリストに明示的に変換
+            delta_list = list(opt_delta) if hasattr(opt_delta, '__iter__') else [opt_delta]
+            accel_list = list(opt_a) if hasattr(opt_a, '__iter__') else [opt_a]
+            
+            delta_seq = delta_list[:self.buffer_horizon] if len(delta_list) >= self.buffer_horizon else delta_list + [delta_list[-1]] * (self.buffer_horizon - len(delta_list))
+            accel_seq = accel_list[:self.buffer_horizon] if len(accel_list) >= self.buffer_horizon else accel_list + [accel_list[-1]] * (self.buffer_horizon - len(accel_list))
+            
+            print(f"[MPC] バッファに追加: delta_seq長={len(delta_seq)}, 最初の3値={[f'{d:.4f}' for d in delta_seq[:3]]}")
+            
+            # バッファに追加（計算時刻をそのまま記録）
+            # レイテンシーはバッファ側で管理
+            self.control_buffer.add_control_sequence(
+                delta_seq, 
+                accel_seq, 
+                current_time,  # 計算開始時刻
+                self.latency
+            )
+        
+    def solve(self, state, coeffs, prev_delta, prev_a, ref_v, current_time=None):
+        """
+        MPC最適化を開始（レイテンシー対応）
+        
+        Args:
+            state: 現在の状態
+            coeffs: 経路係数
+            prev_delta: 前回のステアリング角度
+            prev_a: 前回の加速度
+            ref_v: 参照速度
+            current_time: 現在時刻
+            
+        Returns:
+            制御信号をバッファから取得して返す
+        """
+        if current_time is None:
+            current_time = time.time()
+        
+        # MPC計算を実行してバッファに追加（同期実行）
+        # レイテンシーはタイムスタンプでシミュレート
+        self.solve_sync(state, coeffs, prev_delta, prev_a, ref_v, current_time)
+        
+        # バッファから現在時刻に対応する制御信号を取得
+        # 最初の数ステップはバッファが空なので前回値を使用
+        delta, accel, is_valid = self.control_buffer.get_control_signal(current_time)
+        
+        if not is_valid:
+            print("[MPC] 警告: バッファに有効な制御信号なし、前回値を使用")
+            delta = prev_delta
+            accel = prev_a
+        
+        # 従来のインターフェースとの互換性のため
+        return delta, [accel], None, None
+    
+    def _solve_mpc(self, state, coeffs, prev_delta, prev_a, ref_v):
+        """実際のMPC最適化計算"""
         opti = ca.Opti()
 
         N = self.N
@@ -227,25 +300,26 @@ class MPCController:
             opti.set_initial(epsi, self.previous_solution['epsi'])
             opti.set_initial(delta, self.previous_solution['delta'])
             opti.set_initial(a, self.previous_solution['a'])
-            print("Warm start used for optimization.")
+            print("[MPC] Warm start used for optimization.")
         else:
-            print("No warm start available. Using default initialization.")
+            print("[MPC] No warm start available. Using default initialization.")
         
         opts = {
-            'ipopt.print_level': 1,
+            'ipopt.print_level': 0,  # 出力を抑制
             'ipopt.sb': 'yes',
             'print_time': False,
             'ipopt.max_iter': 1000,
-            'ipopt.tol': 1e-6,       # Adjust tolerance for more precision
-            'ipopt.acceptable_tol': 1e-5  # Set an acceptable tolerance level
+            'ipopt.tol': 1e-6,
+            'ipopt.acceptable_tol': 1e-5
         }
         opti.solver('ipopt', opts)
 
         try:
             sol = opti.solve()
         except RuntimeError:
-            print("Solver failed!")
+            print("[MPC] Solver failed!")
             return None
+        
         # Save solution for warm start
         self.previous_solution['x'] = sol.value(x)
         self.previous_solution['y'] = sol.value(y)
@@ -256,10 +330,11 @@ class MPCController:
         self.previous_solution['delta'] = sol.value(delta)
         self.previous_solution['a'] = sol.value(a)
 
+        # CasADi DMオブジェクトをnumpy配列に変換
+        opt_delta = np.array(sol.value(delta)).flatten()
+        opt_a = np.array(sol.value(a)).flatten()
+        mpc_x = np.array(sol.value(x)).flatten()
+        mpc_y = np.array(sol.value(y)).flatten()
 
-        opt_delta = sol.value(delta[0])
-        opt_a = sol.value(a)
-        mpc_x = sol.value(x)
-        mpc_y = sol.value(y)
-
+        print(f"[MPC] 最適化成功: delta[0]={opt_delta[0]:.4f}, delta[1]={opt_delta[1]:.4f}, a[0]={opt_a[0]:.3f}, 配列長={len(opt_delta)}")
         return opt_delta, opt_a, mpc_x, mpc_y

@@ -76,9 +76,10 @@ def get_waypoints(waypoints_list, N, vehicle_x, vehicle_y, vehicle_psi, current_
 
     # Handle case when no waypoint ahead is found
     if min_distance == float('inf'):
-        print("Warning: No waypoint ahead found. Using current waypoint index.")
+        print("Warning: No waypoint ahead found. Returning dummy waypoints.")
         closest_idx = current_wp_idx
-        return [1,2,3,4], 1000
+        # 有効な座標タプルのリストを返す
+        return [(1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0)], 1000
 
     # Select the next N waypoints
     end_idx = min(closest_idx + N, num_waypoints)
@@ -349,8 +350,21 @@ class MPCAgent(object):
         # Define the initial state for MPC
         current_state = np.array([pred_x, pred_y, pred_psi, pred_v, pred_cte, pred_epsi])
         print("Min Acceleration: ", min(calculated_acceleration, self.prev_a))
+        
+        # 現在時刻を取得してMPCに渡す（レイテンシー対応）
+        import time as time_module
+        current_time = time_module.time()
+        
         # Solve MPC to obtain the optimal delta and acceleration
-        optimal_delta, optimal_a, mpc_x, mpc_y = self.mpc_controller.solve(current_state, coeffs, self.prev_delta, self.prev_a, self.ref_v)
+        optimal_delta, optimal_a, mpc_x, mpc_y = self.mpc_controller.solve(
+            current_state, coeffs, self.prev_delta, self.prev_a, self.ref_v, current_time
+        )
+        
+        # mpc_x, mpc_yはレイテンシー対応モードではNoneになる（バッファから取得するため）
+        if optimal_delta is None or optimal_a is None:
+            print("[MPC Agent] 警告: 制御信号がNone、前回値を使用")
+            optimal_delta = self.prev_delta
+            optimal_a = [self.prev_a]
 
         # Update for next timestep
         self.prev_delta = optimal_delta
