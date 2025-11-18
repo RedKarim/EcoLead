@@ -504,7 +504,7 @@ class MPCAgent(object):
         # 初期状態（単一ステップ予測）
         current_state = np.array([pred_x, pred_y, pred_psi, pred_v, pred_cte, pred_epsi])
         
-        # レイテンシ補償適用
+        # レイテンシ補償適用（縦方向のみ）
         if self.enable_latency_compensation:
             # アダプティブレイテンシ測定
             adaptive_latency = None
@@ -516,25 +516,44 @@ class MPCAgent(object):
                 latency_to_use = self.latency_sec
                 print(f"[MPC Agent] Using fixed latency: {latency_to_use}s")
             
-            # レイテンシを考慮した状態予測
-            prev_control = [self.prev_delta, self.prev_a]
-            predicted_state = predict_state_with_latency(
-                current_state, 
-                prev_control, 
-                self.dt, 
-                latency_to_use, 
-                self.vehicle_params,
-                coeffs
-            )
+            # 縦方向のみレイテンシ補償：速度を予測
+            # 横方向(x, y, psi, CTE, epsi)は現在状態を使用
+            num_steps = int(latency_to_use / self.dt)
+            
+            # 車両パラメータ
+            Cd = self.vehicle_params['Cd']
+            rho_a = self.vehicle_params['rho_a']
+            Av = self.vehicle_params['Av']
+            Mh = self.vehicle_params['Mh']
+            mu = self.vehicle_params['mu']
+            g = self.vehicle_params['g']
+            
+            # 速度の予測（縦方向のみ）
+            v_pred = current_state[3]  # 初期速度
+            for _ in range(num_steps):
+                v_safe = max(v_pred, 0.0)
+                a_drag = 0.5 * Cd * rho_a * Av * (v_safe**2) / Mh
+                a_roll = mu * g
+                a_net = self.prev_a - a_drag - a_roll
+                v_pred = v_pred + a_net * self.dt
+                v_pred = max(v_pred, 0.0)
+            
+            # 横方向は現在状態、縦方向のみ予測速度を使用
+            mpc_state = np.array([
+                current_state[0],  # x - 現在
+                current_state[1],  # y - 現在
+                current_state[2],  # psi - 現在
+                v_pred,            # v - 予測（レイテンシ補償）
+                current_state[4],  # CTE - 現在
+                current_state[5]   # epsi - 現在
+            ])
             
             # ログ記録
-            self._log_latency_compensation(current_state, predicted_state, latency_to_use, adaptive_latency)
+            self._log_latency_compensation(current_state, mpc_state, latency_to_use, adaptive_latency)
             
-            # 予測状態をMPCに渡す
-            mpc_state = predicted_state
-            print(f"[MPC Agent] Latency compensation applied: {latency_to_use}s ahead")
-            print(f"[MPC Agent] Current:   x={current_state[0]:.2f}, y={current_state[1]:.2f}, v={current_state[3]:.2f}, CTE={current_state[4]:.3f}, epsi={current_state[5]:.3f}")
-            print(f"[MPC Agent] Predicted: x={predicted_state[0]:.2f}, y={predicted_state[1]:.2f}, v={predicted_state[3]:.2f}, CTE={predicted_state[4]:.3f}, epsi={predicted_state[5]:.3f}")
+            print(f"[MPC Agent] Latency compensation (longitudinal only): {latency_to_use}s ahead")
+            print(f"[MPC Agent] Current v={current_state[3]:.2f} m/s → Predicted v={v_pred:.2f} m/s")
+            print(f"[MPC Agent] Lateral: x={current_state[0]:.2f}, CTE={current_state[4]:.3f}, epsi={current_state[5]:.3f} (no compensation)")
         else:
             mpc_state = current_state
             print("[MPC Agent] Latency compensation disabled")

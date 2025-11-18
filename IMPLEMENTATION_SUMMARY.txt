@@ -38,21 +38,23 @@ COMPLETED TASKS:
 KEY IMPLEMENTATION DETAILS:
 ================================================================================
 
-State Prediction (lines 156-223 in mpc_agent.py):
-  - Uses bicycle model with drag and rolling resistance
-  - Midpoint integration for improved accuracy
-  - Recalculates CTE/epsi from path polynomial at each step
+State Prediction (lines 507-559 in mpc_agent.py):
+  - LONGITUDINAL ONLY: Predicts velocity forward using physics model
+  - LATERAL: Uses current state (x, y, psi, CTE, epsi) for immediate response
+  - Physics model includes drag and rolling resistance
   - Handles num_steps = int(latency / dt) integration steps
 
-Integration Method:
-  - Midpoint method for velocity: v_mid = v + 0.5 * a_net * dt
-  - Uses v_mid for position/heading updates
-  - More stable than simple Euler forward integration
+Prediction Strategy (IMPORTANT):
+  - Only velocity is predicted forward (longitudinal compensation)
+  - Lateral states (x, y, psi, CTE, epsi) use current values
+  - Rationale: Steering needs immediate response to stay on lane
+  - Acceleration/braking can tolerate prediction for smoother control
 
-CTE/epsi Tracking:
-  - Recalculates from path polynomial: f(x) = c0 + c1*x + c2*x^2 + c3*x^3
-  - psi_des from polynomial derivative
-  - Accurate even with path curvature
+Velocity Prediction:
+  - Simple forward integration: v_next = v + a_net * dt
+  - Accounts for drag: a_drag = 0.5 * Cd * rho_a * Av * v^2 / Mh
+  - Accounts for rolling resistance: a_roll = mu * g
+  - Net acceleration: a_net = a_control - a_drag - a_roll
 
 Vehicle Parameters (synced with mpc_controller.py):
   - Lf = 2.0 m (wheelbase)

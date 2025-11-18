@@ -4,7 +4,8 @@ LATENCY COMPENSATION IN ECOLEAD - USAGE GUIDE
 
 OVERVIEW:
 Latency-aware horizon shifting compensates for network delay in remote MPC
-by predicting vehicle state forward using bicycle model dynamics.
+by predicting ONLY the longitudinal (velocity) state forward.
+Lateral control (steering, CTE, epsi) uses current state for immediate response.
 Default latency: 0.2s (tunable based on actual network conditions)
 
 ================================================================================
@@ -20,16 +21,19 @@ latency:
 HOW IT WORKS:
 ================================================================================
 
-1. Before sending state to MPC, predict vehicle state forward by latency_sec
-2. Use bicycle model equations:
-   - x_{t+1} = x_t + v_t * cos(ψ_t) * Δt
-   - y_{t+1} = y_t + v_t * sin(ψ_t) * Δt
-   - ψ_{t+1} = ψ_t + (v_t / Lf) * δ_t * Δt
-   - v_{t+1} = v_t + a_net * Δt
+1. Lateral control (x, y, ψ, CTE, epsi): Uses CURRENT state
+   → Immediate steering response for lane keeping
+   → No latency prediction to avoid oscillation
+
+2. Longitudinal control (velocity): Predicts forward by latency_sec
+   → Compensates for acceleration/braking delay
+   → Uses physics model: v_{t+1} = v_t + a_net * Δt
    where a_net = u - 0.5 * Cd * ρa * Av * v_t^2 / Mh - μ * g
 
-3. MPC receives predicted state instead of current state
-4. Compensates for delay, reducing overshoot and oscillation
+3. MPC receives hybrid state: [x_current, y_current, ψ_current, v_predicted, 
+                                CTE_current, epsi_current]
+
+4. Result: Smooth velocity control with responsive steering
 
 ================================================================================
 RUNNING EXPERIMENTS:
