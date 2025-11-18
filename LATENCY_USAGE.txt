@@ -3,8 +3,9 @@ LATENCY COMPENSATION IN ECOLEAD - USAGE GUIDE
 ================================================================================
 
 OVERVIEW:
-Latency-aware horizon shifting compensates for 0.8s network delay in remote MPC
+Latency-aware horizon shifting compensates for network delay in remote MPC
 by predicting vehicle state forward using bicycle model dynamics.
+Default latency: 0.2s (tunable based on actual network conditions)
 
 ================================================================================
 CONFIGURATION (src/config/config.yaml):
@@ -12,7 +13,7 @@ CONFIGURATION (src/config/config.yaml):
 
 latency:
   enable_compensation: true   # Toggle compensation on/off
-  latency_sec: 0.8           # Fixed latency (seconds)
+  latency_sec: 0.2           # Fixed latency (seconds) - tune based on network
   enable_adaptive: false     # Adaptive latency measurement
 
 ================================================================================
@@ -72,6 +73,33 @@ With latency compensation:
   ✓ Better tracking performance under network delay
 
 ================================================================================
+TUNING LATENCY COMPENSATION:
+================================================================================
+
+The latency_sec parameter should be tuned based on your network conditions:
+
+  - Start with 0.2s (default, conservative)
+  - If you have measured network latency, use that value
+  - Too high → vehicle deviates from lane (over-compensation)
+  - Too low → poor tracking under actual delay (under-compensation)
+
+Recommended values:
+  - Local simulation: 0.1 - 0.2s
+  - LAN network: 0.2 - 0.3s
+  - WAN/Internet: 0.3 - 0.5s
+  - High latency: 0.5 - 0.8s (may require weight tuning)
+
+Signs of over-compensation:
+  - Vehicle oscillates or drifts from lane center
+  - Large CTE values in logs
+  - Unstable steering behavior
+
+Signs of under-compensation:
+  - Poor trajectory tracking despite MPC
+  - Delayed response to curves
+  - Performance similar to no compensation
+
+================================================================================
 ADAPTIVE LATENCY (Optional):
 ================================================================================
 
@@ -79,6 +107,7 @@ Enable adaptive latency measurement:
   1. Edit config.yaml: enable_adaptive: true
   2. System measures actual round-trip latency using timestamps
   3. Uses moving average (50 samples) for compensation
+  4. More robust to varying network conditions
 
 ================================================================================
 LOG FILES:

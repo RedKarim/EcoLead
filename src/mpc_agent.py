@@ -180,21 +180,24 @@ def predict_state_with_latency(current_state, prev_control, dt, latency, vehicle
     # 統合ステップ数
     num_steps = int(latency / dt)
     
-    # 状態を順伝播
-    for _ in range(num_steps):
-        # 抵抗力による正味加速度
-        a_drag = 0.5 * Cd * rho_a * Av * (v**2) / Mh
+    # 状態を順伝播（改善された数値積分）
+    for step in range(num_steps):
+        # 現在速度での抵抗力を計算
+        v_safe = max(v, 0.0)  # 負の速度を防ぐ
+        a_drag = 0.5 * Cd * rho_a * Av * (v_safe**2) / Mh
         a_roll = mu * g
         a_net = a - a_drag - a_roll
         
-        # 運動学方程式（車両座標系）
-        x_next = x + v * np.cos(psi) * dt
-        y_next = y + v * np.sin(psi) * dt
-        psi_next = psi + (v / Lf) * delta * dt
-        v_next = v + a_net * dt
+        # 中点法での速度更新（より正確）
+        v_mid = v + 0.5 * a_net * dt
+        v_mid = max(v_mid, 0.0)
         
-        # 速度は非負
-        v_next = max(v_next, 0.0)
+        # 運動学方程式（車両座標系、中点法）
+        x_next = x + v_mid * np.cos(psi) * dt
+        y_next = y + v_mid * np.sin(psi) * dt
+        psi_next = psi + (v_mid / Lf) * delta * dt
+        v_next = v + a_net * dt
+        v_next = max(v_next, 0.0)  # 速度は非負
         
         # 角度正規化
         psi_next = normalize_angle(psi_next)
@@ -208,7 +211,7 @@ def predict_state_with_latency(current_state, prev_control, dt, latency, vehicle
             epsi_next = psi_next - psi_des
         else:
             # 経路多項式がない場合、近似的に更新
-            cte_next = cte + v * np.sin(epsi) * dt
+            cte_next = cte + v_mid * np.sin(epsi) * dt
             epsi_next = epsi
         
         epsi_next = normalize_angle(epsi_next)

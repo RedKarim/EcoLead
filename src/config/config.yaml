@@ -8,8 +8,8 @@ MPCController:
 
   # Latency compensation settings
   latency:
-    enable_compensation: false # Enable/disable latency compensation
-    latency_sec: 0.8 # Average round-trip latency (seconds)
+    enable_compensation: true # Enable/disable latency compensation
+    latency_sec: 0.2 # Average round-trip latency (seconds) - reduced from 0.8 for stability
     enable_adaptive: false # Enable adaptive latency measurement
 
   # Cost function weights
