@@ -530,8 +530,8 @@ class MPCAgent(object):
             # 予測状態をMPCに渡す
             mpc_state = predicted_state
             print(f"[MPC Agent] Latency compensation applied: {latency_to_use}s ahead")
-            print(f"[MPC Agent] Current state: x={current_state[0]:.2f}, v={current_state[3]:.2f}")
-            print(f"[MPC Agent] Predicted state: x={predicted_state[0]:.2f}, v={predicted_state[3]:.2f}")
+            print(f"[MPC Agent] Current:   x={current_state[0]:.2f}, y={current_state[1]:.2f}, v={current_state[3]:.2f}, CTE={current_state[4]:.3f}, epsi={current_state[5]:.3f}")
+            print(f"[MPC Agent] Predicted: x={predicted_state[0]:.2f}, y={predicted_state[1]:.2f}, v={predicted_state[3]:.2f}, CTE={predicted_state[4]:.3f}, epsi={predicted_state[5]:.3f}")
         else:
             mpc_state = current_state
             print("[MPC Agent] Latency compensation disabled")
