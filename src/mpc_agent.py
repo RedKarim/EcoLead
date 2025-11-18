@@ -153,7 +153,7 @@ def normalize_angle(angle):
     return np.arctan2(np.sin(angle), np.cos(angle))
 
 
-def predict_state_with_latency(current_state, prev_control, dt, latency, vehicle_params):
+def predict_state_with_latency(current_state, prev_control, dt, latency, vehicle_params, coeffs=None):
     """
     レイテンシを考慮した状態予測（バイシクルモデル）
     
@@ -162,6 +162,7 @@ def predict_state_with_latency(current_state, prev_control, dt, latency, vehicle
     :param dt: タイムステップ (s)
     :param latency: 予測するレイテンシ (s)
     :param vehicle_params: 車両パラメータ辞書
+    :param coeffs: 経路多項式係数 [c0, c1, c2, c3] (オプション)
     :return: 予測された状態 [x, y, ψ, v, CTE, eψ]
     """
     x, y, psi, v, cte, epsi = current_state
@@ -186,7 +187,7 @@ def predict_state_with_latency(current_state, prev_control, dt, latency, vehicle
         a_roll = mu * g
         a_net = a - a_drag - a_roll
         
-        # 運動学方程式
+        # 運動学方程式（車両座標系）
         x_next = x + v * np.cos(psi) * dt
         y_next = y + v * np.sin(psi) * dt
         psi_next = psi + (v / Lf) * delta * dt
@@ -198,9 +199,18 @@ def predict_state_with_latency(current_state, prev_control, dt, latency, vehicle
         # 角度正規化
         psi_next = normalize_angle(psi_next)
         
-        # CTE と eψ の更新（車両座標系での伝播）
-        cte_next = cte + v * np.sin(epsi) * dt
-        epsi_next = epsi + (v / Lf) * delta * dt
+        # CTE と eψ の更新
+        if coeffs is not None:
+            # 経路多項式がある場合、x位置での経路を再計算
+            f_x = coeffs[0] + coeffs[1] * x_next + coeffs[2] * (x_next**2) + coeffs[3] * (x_next**3)
+            psi_des = np.arctan(coeffs[1] + 2 * coeffs[2] * x_next + 3 * coeffs[3] * (x_next**2))
+            cte_next = f_x - y_next
+            epsi_next = psi_next - psi_des
+        else:
+            # 経路多項式がない場合、近似的に更新
+            cte_next = cte + v * np.sin(epsi) * dt
+            epsi_next = epsi
+        
         epsi_next = normalize_angle(epsi_next)
         
         # 状態更新
@@ -510,7 +520,8 @@ class MPCAgent(object):
                 prev_control, 
                 self.dt, 
                 latency_to_use, 
-                self.vehicle_params
+                self.vehicle_params,
+                coeffs
             )
             
             # ログ記録
