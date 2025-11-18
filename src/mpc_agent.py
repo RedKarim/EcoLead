@@ -75,11 +75,12 @@ def get_waypoints(waypoints_list, N, vehicle_x, vehicle_y, vehicle_psi, current_
             # Waypoint is behind the vehicle
             continue
 
-    # Handle case when no waypoint ahead is found
+    # Handle case when no waypoint ahead is found (route completed)
     if min_distance == float('inf'):
-        print("Warning: No waypoint ahead found. Using current waypoint index.")
+        print("Warning: No waypoint ahead found. Route may be completed.")
         closest_idx = current_wp_idx
-        return [1,2,3,4], 1000
+        # Return None to signal route completion
+        return None, current_wp_idx
 
     # Select the next N waypoints
     end_idx = min(closest_idx + N, num_waypoints)
@@ -462,15 +463,15 @@ class MPCAgent(object):
             self.current_wp_idx
         )
 
-        # Check if waypoints_coords is not empty
-        # if self.current_wp_idx == 1000:
-        #     print("No waypoints available for control computation.")
-        #     control = carla.VehicleControl()
-        #     control.steer = 0.0
-        #     control.throttle = 0.0
-        #     control.brake = 1.0  # Full brake to stop the vehicle
-        #     self.vehicle.apply_control(control)
-        #     return 0, True # Exit the function early
+        # Check if waypoints are available (route completion)
+        if waypoints_coords is None:
+            print("[MPC Agent] Route completed - no waypoints ahead.")
+            control = carla.VehicleControl()
+            control.steer = 0.0
+            control.throttle = 0.0
+            control.brake = 1.0  # Full brake to stop the vehicle
+            self.vehicle.apply_control(control)
+            return 0, True, self.ref_v  # Signal route end
 
         if stop_location:
             control = carla.VehicleControl()
