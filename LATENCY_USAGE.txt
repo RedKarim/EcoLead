@@ -1,0 +1,92 @@
+================================================================================
+LATENCY COMPENSATION IN ECOLEAD - USAGE GUIDE
+================================================================================
+
+OVERVIEW:
+Latency-aware horizon shifting compensates for 0.8s network delay in remote MPC
+by predicting vehicle state forward using bicycle model dynamics.
+
+================================================================================
+CONFIGURATION (src/config/config.yaml):
+================================================================================
+
+latency:
+  enable_compensation: true   # Toggle compensation on/off
+  latency_sec: 0.8           # Fixed latency (seconds)
+  enable_adaptive: false     # Adaptive latency measurement
+
+================================================================================
+HOW IT WORKS:
+================================================================================
+
+1. Before sending state to MPC, predict vehicle state forward by latency_sec
+2. Use bicycle model equations:
+   - x_{t+1} = x_t + v_t * cos(ψ_t) * Δt
+   - y_{t+1} = y_t + v_t * sin(ψ_t) * Δt
+   - ψ_{t+1} = ψ_t + (v_t / Lf) * δ_t * Δt
+   - v_{t+1} = v_t + a_net * Δt
+   where a_net = u - 0.5 * Cd * ρa * Av * v_t^2 / Mh - μ * g
+
+3. MPC receives predicted state instead of current state
+4. Compensates for delay, reducing overshoot and oscillation
+
+================================================================================
+RUNNING EXPERIMENTS:
+================================================================================
+
+BASELINE (No Compensation):
+  1. Edit config.yaml: enable_compensation: false
+  2. Run: python3 main.py MPC
+  3. Log generated: latency_compensation_log_YYYY-MM-DD.csv
+
+COMPENSATED (With Compensation):
+  1. Edit config.yaml: enable_compensation: true
+  2. Run: python3 main.py MPC
+  3. Log generated: latency_compensation_log_YYYY-MM-DD.csv
+
+================================================================================
+VALIDATION:
+================================================================================
+
+Compare baseline vs compensated runs:
+
+python3 src/evaluation/validate_latency_compensation.py \
+  --baseline latency_compensation_log_baseline.csv \
+  --compensated latency_compensation_log_compensated.csv \
+  --output ./validation_results
+
+Output:
+  - validation_comparison_*.png  (CTE, velocity, trajectory plots)
+  - latency_analysis_*.png       (prediction errors, latency)
+  - validation_report_*.txt      (metrics and improvements)
+
+================================================================================
+EXPECTED RESULTS:
+================================================================================
+
+With latency compensation:
+  ✓ Reduced CTE (Cross-Track Error)
+  ✓ Lower velocity oscillation
+  ✓ Smoother trajectories
+  ✓ Fuel consumption close to zero-delay baseline
+  ✓ Better tracking performance under network delay
+
+================================================================================
+ADAPTIVE LATENCY (Optional):
+================================================================================
+
+Enable adaptive latency measurement:
+  1. Edit config.yaml: enable_adaptive: true
+  2. System measures actual round-trip latency using timestamps
+  3. Uses moving average (50 samples) for compensation
+
+================================================================================
+LOG FILES:
+================================================================================
+
+latency_compensation_log_YYYY-MM-DD.csv contains:
+  - timestamp, current state (x, y, ψ, v, CTE, eψ)
+  - predicted state (x, y, ψ, v, CTE, eψ)
+  - latency_used, adaptive_latency
+
+================================================================================

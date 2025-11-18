@@ -43,6 +43,7 @@ import csv
 from datetime import datetime
 import utils
 import yaml
+import time
 
 
 def get_waypoints(waypoints_list, N, vehicle_x, vehicle_y, vehicle_psi, current_wp_idx):
@@ -152,6 +153,63 @@ def normalize_angle(angle):
     return np.arctan2(np.sin(angle), np.cos(angle))
 
 
+def predict_state_with_latency(current_state, prev_control, dt, latency, vehicle_params):
+    """
+    レイテンシを考慮した状態予測（バイシクルモデル）
+    
+    :param current_state: 現在の状態 [x, y, ψ, v, CTE, eψ]
+    :param prev_control: 前回の制御入力 [δ, a]
+    :param dt: タイムステップ (s)
+    :param latency: 予測するレイテンシ (s)
+    :param vehicle_params: 車両パラメータ辞書
+    :return: 予測された状態 [x, y, ψ, v, CTE, eψ]
+    """
+    x, y, psi, v, cte, epsi = current_state
+    delta, a = prev_control
+    
+    # 車両パラメータ
+    Lf = vehicle_params['Lf']
+    Cd = vehicle_params['Cd']
+    rho_a = vehicle_params['rho_a']
+    Av = vehicle_params['Av']
+    Mh = vehicle_params['Mh']
+    mu = vehicle_params['mu']
+    g = vehicle_params['g']
+    
+    # 統合ステップ数
+    num_steps = int(latency / dt)
+    
+    # 状態を順伝播
+    for _ in range(num_steps):
+        # 抵抗力による正味加速度
+        a_drag = 0.5 * Cd * rho_a * Av * (v**2) / Mh
+        a_roll = mu * g
+        a_net = a - a_drag - a_roll
+        
+        # 運動学方程式
+        x_next = x + v * np.cos(psi) * dt
+        y_next = y + v * np.sin(psi) * dt
+        psi_next = psi + (v / Lf) * delta * dt
+        v_next = v + a_net * dt
+        
+        # 速度は非負
+        v_next = max(v_next, 0.0)
+        
+        # 角度正規化
+        psi_next = normalize_angle(psi_next)
+        
+        # CTE と eψ の更新（車両座標系での伝播）
+        cte_next = cte + v * np.sin(epsi) * dt
+        epsi_next = epsi + (v / Lf) * delta * dt
+        epsi_next = normalize_angle(epsi_next)
+        
+        # 状態更新
+        x, y, psi, v = x_next, y_next, psi_next, v_next
+        cte, epsi = cte_next, epsi_next
+    
+    return np.array([x, y, psi, v, cte, epsi])
+
+
 def write_data_to_csv(data_list, filename_prefix='important_data'):
     current_date = datetime.now().strftime('%Y-%m-%d')
     filename = f"{filename_prefix}_{current_date}.csv"
@@ -176,6 +234,7 @@ class MPCAgent(object):
         mpc_config = config.get('MPCController', {})
         weights = mpc_config.get('weights', {})
         fuel_coeffs = mpc_config.get('fuel_consumption', {})
+        latency_config = mpc_config.get('latency', {})
 
         # Initialize parameters
         self.N = mpc_config.get('N', 10)
@@ -188,6 +247,16 @@ class MPCAgent(object):
         self.v_max = mpc_config.get('v_max', 14.0)
         self.previous_velocity = 0
         self.last_ref_update_time = 0.0
+        
+        # レイテンシ補償設定
+        self.enable_latency_compensation = latency_config.get('enable_compensation', False)
+        self.latency_sec = latency_config.get('latency_sec', 0.8)
+        self.enable_adaptive_latency = latency_config.get('enable_adaptive', False)
+        
+        # アダプティブレイテンシ測定用
+        self.latency_measurements = []
+        self.max_latency_samples = 50
+        self.last_mpc_send_time = None
 
         
         # Cost function weights
@@ -221,12 +290,85 @@ class MPCAgent(object):
         self.ego_model = EgoModel(self.dt)
         # Initializing the MPC controller
         self.mpc_controller = MPCController(self.ego_model,mpc_config,weights,fuel_coeffs)
+        
+        # 車両パラメータ（レイテンシ予測用、mpc_controller.pyと同期）
+        self.vehicle_params = {
+            'Lf': 2.0,  # MPCコントローラと同じ値
+            'Cd': 0.3,  # C_D in mpc_controller.py
+            'rho_a': 1.225,  # rho_a in mpc_controller.py
+            'Av': 2.2,  # A_v in mpc_controller.py
+            'Mh': 1500.0,  # M_h in mpc_controller.py
+            'mu': 0.01,  # Rolling resistance coefficient
+            'g': 9.81  # Gravitational acceleration
+        }
+        
         # Read waypoints from CSV. For Standalone mode, seperate calling.
         # Read waypoints from CSV. For Standalone mode, seperate calling.
         self.waypoints = utils.read_waypoints_from_csv("config/route.csv")
         self.waypoint_locations = [carla.Location(x=wp['x'], y=wp['y'], z=wp['z']) for wp in self.waypoints]
         self.current_wp_idx = 0  # Initialize current waypoint index
+        
+        # ログ用CSVファイル初期化
+        if self.enable_latency_compensation:
+            self._initialize_latency_log()
 
+    def _initialize_latency_log(self):
+        """ログファイル初期化"""
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        self.latency_log_filename = f"latency_compensation_log_{current_date}.csv"
+        fieldnames = ['timestamp', 'current_x', 'current_y', 'current_psi', 'current_v', 
+                      'predicted_x', 'predicted_y', 'predicted_psi', 'predicted_v',
+                      'current_cte', 'predicted_cte', 'current_epsi', 'predicted_epsi',
+                      'latency_used', 'adaptive_latency']
+        
+        file_exists = os.path.isfile(self.latency_log_filename)
+        if not file_exists or os.stat(self.latency_log_filename).st_size == 0:
+            with open(self.latency_log_filename, mode='w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+        
+        print(f"[MPC Agent] Latency compensation log initialized: {self.latency_log_filename}")
+    
+    def _log_latency_compensation(self, current_state, predicted_state, latency_used, adaptive_latency=None):
+        """レイテンシ補償ログ記録"""
+        log_data = {
+            'timestamp': time.time(),
+            'current_x': current_state[0],
+            'current_y': current_state[1],
+            'current_psi': current_state[2],
+            'current_v': current_state[3],
+            'predicted_x': predicted_state[0],
+            'predicted_y': predicted_state[1],
+            'predicted_psi': predicted_state[2],
+            'predicted_v': predicted_state[3],
+            'current_cte': current_state[4],
+            'predicted_cte': predicted_state[4],
+            'current_epsi': current_state[5],
+            'predicted_epsi': predicted_state[5],
+            'latency_used': latency_used,
+            'adaptive_latency': adaptive_latency if adaptive_latency is not None else 'N/A'
+        }
+        
+        with open(self.latency_log_filename, mode='a', newline='') as csvfile:
+            fieldnames = log_data.keys()
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writerow(log_data)
+    
+    def _update_adaptive_latency(self):
+        """アダプティブレイテンシ測定（タイムスタンプベース）"""
+        if self.last_mpc_send_time is not None:
+            current_time = time.time()
+            measured_latency = current_time - self.last_mpc_send_time
+            
+            self.latency_measurements.append(measured_latency)
+            if len(self.latency_measurements) > self.max_latency_samples:
+                self.latency_measurements.pop(0)
+            
+            # 移動平均
+            adaptive_latency = np.mean(self.latency_measurements)
+            return adaptive_latency
+        return self.latency_sec
+    
     def get_vehicle_state(self):
         """
         Retrieves the vehicle state information from the CARLA vehicle actor.
@@ -346,11 +488,50 @@ class MPCAgent(object):
         pred_cte = cte + current_velocity * np.sin(epsi) * self.dt
         pred_epsi = normalize_angle(epsi + pred_psi)
 
-        # Define the initial state for MPC
+        # 初期状態（単一ステップ予測）
         current_state = np.array([pred_x, pred_y, pred_psi, pred_v, pred_cte, pred_epsi])
+        
+        # レイテンシ補償適用
+        if self.enable_latency_compensation:
+            # アダプティブレイテンシ測定
+            adaptive_latency = None
+            if self.enable_adaptive_latency:
+                adaptive_latency = self._update_adaptive_latency()
+                latency_to_use = adaptive_latency
+                print(f"[MPC Agent] Adaptive latency: {adaptive_latency:.3f}s")
+            else:
+                latency_to_use = self.latency_sec
+                print(f"[MPC Agent] Using fixed latency: {latency_to_use}s")
+            
+            # レイテンシを考慮した状態予測
+            prev_control = [self.prev_delta, self.prev_a]
+            predicted_state = predict_state_with_latency(
+                current_state, 
+                prev_control, 
+                self.dt, 
+                latency_to_use, 
+                self.vehicle_params
+            )
+            
+            # ログ記録
+            self._log_latency_compensation(current_state, predicted_state, latency_to_use, adaptive_latency)
+            
+            # 予測状態をMPCに渡す
+            mpc_state = predicted_state
+            print(f"[MPC Agent] Latency compensation applied: {latency_to_use}s ahead")
+            print(f"[MPC Agent] Current state: x={current_state[0]:.2f}, v={current_state[3]:.2f}")
+            print(f"[MPC Agent] Predicted state: x={predicted_state[0]:.2f}, v={predicted_state[3]:.2f}")
+        else:
+            mpc_state = current_state
+            print("[MPC Agent] Latency compensation disabled")
+        
+        # MPC送信時刻記録（アダプティブレイテンシ用）
+        if self.enable_adaptive_latency:
+            self.last_mpc_send_time = time.time()
+        
         print("Min Acceleration: ", min(calculated_acceleration, self.prev_a))
         # Solve MPC to obtain the optimal delta and acceleration
-        optimal_delta, optimal_a, mpc_x, mpc_y = self.mpc_controller.solve(current_state, coeffs, self.prev_delta, self.prev_a, self.ref_v)
+        optimal_delta, optimal_a, mpc_x, mpc_y = self.mpc_controller.solve(mpc_state, coeffs, self.prev_delta, self.prev_a, self.ref_v)
 
         # Update for next timestep
         self.prev_delta = optimal_delta
