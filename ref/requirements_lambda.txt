@@ -1,0 +1,9 @@
+# AWS Lambda用MPCコントローラーの依存関係
+# CasADiとNumPyは必須
+numpy==1.24.3
+casadi==3.6.4
+boto3==1.34.0
+botocore==1.34.0
+
+# AWS Lambda環境でのパッケージサイズ制限に注意
+# CasADiは大きなパッケージのため、Lambda Layerの使用を推奨

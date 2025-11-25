@@ -36,13 +36,38 @@
 import carla
 import numpy as np
 import os
-from mpc_controller import MPCController # importing the MPC controller
+# from mpc_controller import MPCController # importing the MPC controller - DISABLED for distributed MPC
 import math
 from ego_model import EgoModel
 import csv
 from datetime import datetime
 import utils
 import yaml
+import json
+import time
+import threading
+from collections import deque
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+
+# AWS IoT MQTT client for Lambda MPC
+import paho.mqtt.client as mqtt
+import ssl
+from dotenv import load_dotenv
+
+# 環境変数をロード（複数のファイルを試行）
+env_files = ['.env', 'aws_config.env', 'windows_config.env', '../aws_config.env', '../windows_config.env']
+env_loaded = False
+
+for env_file in env_files:
+    if os.path.exists(env_file):
+        load_dotenv(env_file)
+        print(f"[ENV] Loaded environment from: {env_file}")
+        env_loaded = True
+        break
+
+if not env_loaded:
+    print("[ENV] Warning: No .env file found, using system environment variables")
 
 
 def get_waypoints(waypoints_list, N, vehicle_x, vehicle_y, vehicle_psi, current_wp_idx):
@@ -219,13 +244,376 @@ class MPCAgent(object):
         
         # Initialize the EGO model
         self.ego_model = EgoModel(self.dt)
-        # Initializing the MPC controller
-        self.mpc_controller = MPCController(self.ego_model,mpc_config,weights,fuel_coeffs)
+        # AWS LAMBDA MPC: Initialize AWS IoT instead of local MPC controller
+        self.setup_distributed_mpc()
         # Read waypoints from CSV. For Standalone mode, seperate calling.
         # Read waypoints from CSV. For Standalone mode, seperate calling.
         self.waypoints = utils.read_waypoints_from_csv("config/route.csv")
         self.waypoint_locations = [carla.Location(x=wp['x'], y=wp['y'], z=wp['z']) for wp in self.waypoints]
         self.current_wp_idx = 0  # Initialize current waypoint index
+        
+        # MQTT Performance Metrics
+        self.setup_mqtt_metrics()
+
+    def setup_mqtt_metrics(self):
+        """Setup MQTT performance metrics tracking"""
+        # Packet tracking
+        self.sent_packets = {}  # {packet_id: timestamp}
+        self.packet_counter = 0
+        self.metrics_lock = threading.Lock()
+        
+        # Performance metrics storage
+        self.latency_history = deque(maxlen=1000)  # Keep last 1000 measurements
+        self.packet_loss_history = deque(maxlen=1000)
+        self.time_history = deque(maxlen=1000)
+        
+        # Current metrics
+        self.current_latency = 0.0
+        self.current_packet_loss = 0.0
+        self.total_sent = 0
+        self.total_received = 0
+        self.total_lost = 0
+        
+        # CSV logging
+        self.metrics_csv_file = f"mqtt_metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.init_csv_file()
+        
+        # Real-time plotting
+        self.setup_realtime_plot()
+        
+        # Cleanup thread for old packets (consider lost after 5 seconds)
+        self.cleanup_thread = threading.Thread(target=self.cleanup_old_packets, daemon=True)
+        self.cleanup_thread.start()
+        
+        print("[MQTT Metrics] Performance tracking initialized")
+
+    def init_csv_file(self):
+        """Initialize CSV file for metrics logging"""
+        try:
+            with open(self.metrics_csv_file, 'w', newline='') as csvfile:
+                fieldnames = [
+                    'timestamp', 'packet_id', 'latency_ms', 'packet_loss_percent',
+                    'total_sent', 'total_received', 'total_lost'
+                ]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+            print(f"[MQTT Metrics] CSV file initialized: {self.metrics_csv_file}")
+        except Exception as e:
+            print(f"[MQTT Metrics] Error initializing CSV: {e}")
+
+    def setup_realtime_plot(self):
+        """Setup real-time matplotlib visualization"""
+        try:
+            # Create figure with subplots
+            self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(12, 8))
+            self.fig.suptitle('MQTT Performance Metrics - Real Time')
+            
+            # Latency plot
+            self.ax1.set_title('Round Trip Latency (ms)')
+            self.ax1.set_ylabel('Latency (ms)')
+            self.ax1.grid(True)
+            self.ax1.set_ylim(0, 200)  # Adjust based on expected latency
+            
+            # Packet loss plot
+            self.ax2.set_title('Packet Loss (%)')
+            self.ax2.set_xlabel('Time (s)')
+            self.ax2.set_ylabel('Packet Loss (%)')
+            self.ax2.grid(True)
+            self.ax2.set_ylim(0, 100)
+            
+            # Initialize empty line plots
+            self.latency_line, = self.ax1.plot([], [], 'b-', linewidth=2, label='Latency')
+            self.packet_loss_line, = self.ax2.plot([], [], 'r-', linewidth=2, label='Packet Loss')
+            
+            self.ax1.legend()
+            self.ax2.legend()
+            
+            # Start animation
+            self.anim = animation.FuncAnimation(
+                self.fig, self.update_plot, interval=100, blit=False
+            )
+            
+            # Show plot in non-blocking mode
+            plt.ion()
+            plt.show(block=False)
+            
+            print("[MQTT Metrics] Real-time plot initialized")
+        except Exception as e:
+            print(f"[MQTT Metrics] Error setting up plot: {e}")
+            self.fig = None
+
+    def update_plot(self, frame):
+        """Update the real-time plot"""
+        try:
+            with self.metrics_lock:
+                if len(self.time_history) > 0:
+                    # Update latency plot
+                    self.latency_line.set_data(list(self.time_history), list(self.latency_history))
+                    self.ax1.set_xlim(min(self.time_history), max(self.time_history))
+                    
+                    # Update packet loss plot
+                    self.packet_loss_line.set_data(list(self.time_history), list(self.packet_loss_history))
+                    self.ax2.set_xlim(min(self.time_history), max(self.time_history))
+                    
+                    # Update titles with current values
+                    self.ax1.set_title(f'Round Trip Latency: {self.current_latency:.1f} ms (Avg: {np.mean(list(self.latency_history)):.1f} ms)')
+                    self.ax2.set_title(f'Packet Loss: {self.current_packet_loss:.1f}% (Total: {self.total_sent} sent, {self.total_lost} lost)')
+                    
+            return self.latency_line, self.packet_loss_line
+        except Exception as e:
+            print(f"[MQTT Metrics] Plot update error: {e}")
+            return self.latency_line, self.packet_loss_line
+
+    def cleanup_old_packets(self):
+        """Background thread to clean up old packets (consider them lost)"""
+        while True:
+            try:
+                current_time = time.time()
+                timeout = 5.0  # 5 seconds timeout
+                
+                with self.metrics_lock:
+                    expired_packets = []
+                    for packet_id, timestamp in self.sent_packets.items():
+                        if current_time - timestamp > timeout:
+                            expired_packets.append(packet_id)
+                    
+                    # Remove expired packets and count as lost
+                    for packet_id in expired_packets:
+                        del self.sent_packets[packet_id]
+                        self.total_lost += 1
+                        self.update_packet_loss_metrics()
+                
+                time.sleep(1.0)  # Check every second
+            except Exception as e:
+                print(f"[MQTT Metrics] Cleanup thread error: {e}")
+                time.sleep(1.0)
+
+    def update_packet_loss_metrics(self):
+        """Update packet loss percentage"""
+        if self.total_sent > 0:
+            self.current_packet_loss = (self.total_lost / self.total_sent) * 100.0
+        else:
+            self.current_packet_loss = 0.0
+
+    def log_metrics_to_csv(self, packet_id, latency_ms):
+        """Log metrics to CSV file"""
+        try:
+            with open(self.metrics_csv_file, 'a', newline='') as csvfile:
+                fieldnames = [
+                    'timestamp', 'packet_id', 'latency_ms', 'packet_loss_percent',
+                    'total_sent', 'total_received', 'total_lost'
+                ]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writerow({
+                    'timestamp': datetime.now().isoformat(),
+                    'packet_id': packet_id,
+                    'latency_ms': latency_ms,
+                    'packet_loss_percent': self.current_packet_loss,
+                    'total_sent': self.total_sent,
+                    'total_received': self.total_received,
+                    'total_lost': self.total_lost
+                })
+        except Exception as e:
+            print(f"[MQTT Metrics] CSV logging error: {e}")
+
+    def setup_distributed_mpc(self):
+        """Setup AWS IoT for Lambda MPC communication"""
+        # AWS IoT設定を環境変数から読み込み
+        self.aws_endpoint = os.getenv("AWS_ENDPOINT")
+        self.client_id = os.getenv("CLIENT_ID", "mpc_agent") + "_mpc"
+        self.ca_path = os.getenv("AWS_CA_PATH")
+        self.cert_path = os.getenv("AWS_CERT_PATH") 
+        self.key_path = os.getenv("AWS_KEY_PATH")
+        
+        # デバッグ情報を表示
+        print(f"[AWS IoT] Environment variables:")
+        print(f"  AWS_ENDPOINT: {self.aws_endpoint}")
+        print(f"  CLIENT_ID: {os.getenv('CLIENT_ID')}")
+        print(f"  AWS_CA_PATH: {self.ca_path}")
+        print(f"  AWS_CERT_PATH: {self.cert_path}")
+        print(f"  AWS_KEY_PATH: {self.key_path}")
+        
+        if not all([self.aws_endpoint, self.ca_path, self.cert_path, self.key_path]):
+            missing = []
+            if not self.aws_endpoint: missing.append("AWS_ENDPOINT")
+            if not self.ca_path: missing.append("AWS_CA_PATH")
+            if not self.cert_path: missing.append("AWS_CERT_PATH")
+            if not self.key_path: missing.append("AWS_KEY_PATH")
+            
+            error_msg = f"Missing environment variables: {', '.join(missing)}"
+            print(f"[AWS IoT] Error: {error_msg}")
+            print("[AWS IoT] Please create a .env file with your AWS IoT credentials")
+            raise ValueError(f"AWS IoT credentials not properly configured: {error_msg}")
+        
+        # 証明書ファイルの存在確認とパス解決
+        cert_files = {
+            'CA': self.ca_path,
+            'Certificate': self.cert_path,
+            'Private Key': self.key_path
+        }
+        
+        for name, path in cert_files.items():
+            if not os.path.exists(path):
+                print(f"[AWS IoT] Warning: {name} file not found at: {path}")
+                # 絶対パスで再試行
+                abs_path = os.path.abspath(path)
+                print(f"[AWS IoT] Trying absolute path: {abs_path}")
+                if os.path.exists(abs_path):
+                    print(f"[AWS IoT] Found {name} file at absolute path")
+                    if name == 'CA':
+                        self.ca_path = abs_path
+                    elif name == 'Certificate':
+                        self.cert_path = abs_path
+                    elif name == 'Private Key':
+                        self.key_path = abs_path
+                else:
+                    print(f"[AWS IoT] Error: {name} file not found at {path} or {abs_path}")
+                    raise FileNotFoundError(f"Certificate file not found: {name} at {path}")
+            else:
+                print(f"[AWS IoT] Found {name} file: {path}")
+        
+        print(f"[AWS IoT] Final certificate paths:")
+        print(f"  CA: {self.ca_path}")
+        print(f"  Cert: {self.cert_path}")
+        print(f"  Key: {self.key_path}")
+        
+        try:
+            if hasattr(mqtt, 'CallbackAPIVersion'):
+                self.mqtt_client = mqtt.Client(client_id=self.client_id, callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+            else:
+                self.mqtt_client = mqtt.Client(client_id=self.client_id)
+        except Exception as e:
+            print(f"[AWS IoT] Client creation error: {e}")
+            self.mqtt_client = mqtt.Client(client_id=self.client_id)
+        
+        self.mqtt_client.on_connect = self.on_mqtt_connect
+        self.mqtt_client.on_message = self.on_mqtt_message
+        self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+        
+        # TLS設定
+        self.mqtt_client.tls_set(
+            ca_certs=self.ca_path,
+            certfile=self.cert_path,
+            keyfile=self.key_path,
+            tls_version=ssl.PROTOCOL_TLSv1_2
+        )
+        
+        # MPC result data
+        self.latest_mpc_result = None
+        self.result_lock = threading.Lock()
+        self.result_received = False
+        
+        try:
+            print(f"[AWS IoT] Connecting to {self.aws_endpoint}...")
+            self.mqtt_client.connect(self.aws_endpoint, 8883, 60)
+            self.mqtt_client.loop_start()
+            print(f"[AWS IoT] Connected to AWS IoT Core for Lambda MPC")
+        except Exception as e:
+            print(f"[AWS IoT] Connection failed: {e}")
+            raise
+
+    def on_mqtt_connect(self, client, userdata, flags, rc):
+        """AWS IoT connection callback"""
+        if rc == 0:
+            print("[AWS IoT] Successfully connected to AWS IoT Core")
+            # Subscribe to MPC results from Lambda function
+            client.subscribe("mpc/result", qos=1)
+            print("[AWS IoT] Subscribed to mpc/result")
+        else:
+            print(f"[AWS IoT] Failed to connect, return code {rc}")
+
+    def on_mqtt_disconnect(self, client, userdata, rc):
+        """AWS IoT disconnect callback"""
+        print(f"[AWS IoT] Disconnected with result code {rc}")
+        if rc != 0:
+            print("Unexpected disconnection. Attempting to reconnect...")
+            try:
+                client.reconnect()
+            except Exception as e:
+                print(f"Reconnection failed: {e}")
+
+    def on_mqtt_message(self, client, userdata, msg):
+        """MQTT message received callback"""
+        try:
+            topic = msg.topic
+            payload = json.loads(msg.payload.decode())
+            
+            if topic == "mpc/result":
+                # Extract packet tracking info
+                packet_id = payload.get('packet_id', None)
+                receive_time = time.time()
+                
+                # Calculate latency if packet ID exists
+                if packet_id is not None:
+                    with self.metrics_lock:
+                        if packet_id in self.sent_packets:
+                            # Calculate round-trip latency
+                            send_time = self.sent_packets[packet_id]
+                            latency_ms = (receive_time - send_time) * 1000.0
+                            
+                            # Update metrics
+                            self.total_received += 1
+                            self.current_latency = latency_ms
+                            
+                            # Store in history for plotting
+                            current_sim_time = receive_time - self.simulation_start_time if hasattr(self, 'simulation_start_time') else receive_time
+                            self.latency_history.append(latency_ms)
+                            self.packet_loss_history.append(self.current_packet_loss)
+                            self.time_history.append(current_sim_time)
+                            
+                            # Remove from sent packets (received successfully)
+                            del self.sent_packets[packet_id]
+                            
+                            # Update packet loss metrics
+                            self.update_packet_loss_metrics()
+                            
+                            # Log to CSV
+                            self.log_metrics_to_csv(packet_id, latency_ms)
+                            
+                            print(f"[MQTT Metrics] Packet {packet_id}: RTT = {latency_ms:.1f}ms, Loss = {self.current_packet_loss:.1f}%")
+                        else:
+                            print(f"[MQTT Metrics] Warning: Received unknown packet ID {packet_id}")
+                
+                with self.result_lock:
+                    self.latest_mpc_result = payload
+                    self.result_received = True
+                print(f"[DEBUG] Received AWS Lambda MPC result")
+                
+        except Exception as e:
+            print(f"[AWS IoT] Message processing error: {e}")
+
+    def send_mpc_request(self, state, coeffs, prev_delta, prev_a, ref_v):
+        """Send MPC request to AWS Lambda with packet tracking"""
+        try:
+            # Generate unique packet ID
+            with self.metrics_lock:
+                self.packet_counter += 1
+                packet_id = self.packet_counter
+                send_time = time.time()
+                
+                # Store packet for tracking
+                self.sent_packets[packet_id] = send_time
+                self.total_sent += 1
+                
+                # Initialize simulation start time if not set
+                if not hasattr(self, 'simulation_start_time'):
+                    self.simulation_start_time = send_time
+            
+            request_msg = {
+                'packet_id': packet_id,  # Add packet ID for tracking
+                'timestamp': send_time,
+                'state': [float(s) for s in state],
+                'coeffs': [float(c) for c in coeffs],
+                'prev_delta': float(prev_delta),
+                'prev_a': float(prev_a),
+                'ref_v': float(ref_v)
+            }
+            
+            # AWS IoT経由でリクエスト送信（Lambda関数をトリガー）
+            self.mqtt_client.publish("mpc/request", json.dumps(request_msg), qos=1)
+            print(f"[DEBUG] Sent AWS Lambda MPC request (Packet ID: {packet_id})")
+        except Exception as e:
+            print(f"[AWS IoT] Failed to send request: {e}")
 
     def get_vehicle_state(self):
         """
@@ -349,8 +737,33 @@ class MPCAgent(object):
         # Define the initial state for MPC
         current_state = np.array([pred_x, pred_y, pred_psi, pred_v, pred_cte, pred_epsi])
         print("Min Acceleration: ", min(calculated_acceleration, self.prev_a))
-        # Solve MPC to obtain the optimal delta and acceleration
-        optimal_delta, optimal_a, mpc_x, mpc_y = self.mpc_controller.solve(current_state, coeffs, self.prev_delta, self.prev_a, self.ref_v)
+        
+        # AWS LAMBDA MPC: Send request to AWS Lambda and wait for result
+        self.send_mpc_request(current_state, coeffs, self.prev_delta, self.prev_a, self.ref_v)
+        
+        # Wait for MPC result with timeout (longer for AWS Lambda)
+        timeout = 2.0  # 2 seconds timeout for AWS Lambda
+        start_time = time.time()
+        while not self.result_received and (time.time() - start_time) < timeout:
+            time.sleep(0.001)  # 1ms sleep
+        
+        if self.result_received:
+            with self.result_lock:
+                result = self.latest_mpc_result.copy()
+                self.result_received = False
+            
+            optimal_delta = result['optimal_delta']
+            optimal_a = result['optimal_a']
+            mpc_x = result['mpc_x']
+            mpc_y = result['mpc_y']
+            print(f"[AWS MPC] Received Lambda result: delta={optimal_delta:.3f}, a[0]={optimal_a[0]:.3f}")
+        else:
+            print("[AWS MPC] Timeout waiting for Lambda MPC result, using fallback")
+            # Fallback to safe control
+            optimal_delta = 0.0
+            optimal_a = [0.0] * (self.N - 1)
+            mpc_x = [0.0] * self.N
+            mpc_y = [0.0] * self.N
 
         # Update for next timestep
         self.prev_delta = optimal_delta
@@ -359,8 +772,8 @@ class MPCAgent(object):
 
         # Map acceleration to throttle and brake
         throttle_cmd, brake_cmd = map_acceleration_to_throttle_brake(optimal_a[0], 
-                                                                     self.mpc_controller.a_max, 
-                                                                     -self.mpc_controller.a_max, 
+                                                                     self.a_max, 
+                                                                     -self.a_max, 
                                                                      should_brake=False)
         
         # Compute the steering command

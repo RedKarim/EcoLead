@@ -1,0 +1,36 @@
+{
+  "mqtt": {
+    "broker_host": "localhost",
+    "broker_port": 1883,
+    "topics": {
+      "vehicle_state": "ecolead/vehicle_state",
+      "control_commands": "ecolead/control"
+    },
+    "qos": 1,
+    "keepalive": 60
+  },
+  "carla": {
+    "host": "localhost",
+    "port": 2000,
+    "timeout": 10.0,
+    "synchronous_mode": true,
+    "fixed_delta_seconds": 0.1,
+    "fps": 10
+  },
+  "simulation": {
+    "duration": 300,
+    "reference_velocity_kmh": 50,
+    "route_file": "../src/config/route.csv",
+    "config_file": "../src/config/config.yaml"
+  },
+  "mpc": {
+    "control_frequency_hz": 20,
+    "prediction_horizon": 50,
+    "time_step": 0.1
+  },
+  "logging": {
+    "enabled": true,
+    "csv_output": true,
+    "log_level": "INFO"
+  }
+}
