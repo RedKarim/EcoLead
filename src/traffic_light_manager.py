@@ -774,8 +774,9 @@ class TrafficLightManager:
         Also track the number of times we decided to split.
         """
         mode = result["mode"]
-        vel=result["velocity"]
-        print(f"[Finalize Split Decision] Ref Vel= {vel:.4f} m/s, Mode= {mode}.")
+        vel = result["velocity"]
+        vel_str = f"{vel:.4f}" if vel is not None else "None"
+        print(f"[Finalize Split Decision] Ref Vel= {vel_str} m/s, Mode= {mode}.")
         if mode == "NONE":
             print("[Finalize Split Decision] No subplatoon can pass => fallback to v_min.")
             self.ref_v = self.v_min
@@ -965,8 +966,9 @@ class TrafficLightManager:
                     feasible_range=feasible_range,
                     v_saturation=v_saturation
                 )
-                eta_to_light = max(0.1,tl_data["distance"]/result["velocity"])
-                print(f"[CALC REF VEL] Partial split => Ref Vel= {result['velocity']:.4f} m/s.")
+                safe_vel = result["velocity"] if result["velocity"] is not None else self.v_min
+                eta_to_light = max(0.1, tl_data["distance"] / safe_vel)
+                print(f"[CALC REF VEL] Partial split => Ref Vel= {safe_vel:.4f} m/s.")
                 return self._finalize_split_decision(result, self.corridor_id,eta_to_light)
 
             else:
@@ -982,7 +984,8 @@ class TrafficLightManager:
                     feasible_range=feasible_range,
                     v_saturation=v_saturation
                 )
-                eta_to_light = max(0.1,tl_data["distance"]/result["velocity"])
+                safe_vel = result["velocity"] if result["velocity"] is not None else self.v_min
+                eta_to_light = max(0.1, tl_data["distance"] / safe_vel)
                 return self._finalize_split_decision(result, self.corridor_id,eta_to_light)
 
         # 5) If feasible_range is None => partial or none
@@ -996,7 +999,8 @@ class TrafficLightManager:
             feasible_range=feasible_range,
             v_saturation=v_saturation
         )
-        eta_to_light = max(0.1,tl_data["distance"]/result["velocity"])
+        safe_vel = result["velocity"] if result["velocity"] is not None else self.v_min
+        eta_to_light = max(0.1, tl_data["distance"] / safe_vel)
         return self._finalize_split_decision(result, self.corridor_id,eta_to_light)
 
     def is_red_light_ahead(self, vehicle_location):

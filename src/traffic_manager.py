@@ -277,6 +277,7 @@ class VehicleTrafficManager:
                 leader = False
                 vehicle.apply_control(control)
             if mpc_agent:
+                ego_agent.traffic_manager = self
                 optimal_a, route_end,ref_v_mpc = ego_agent.on_tick(ref_v,False)
                 mpc_agent = False
             platoon_manager.update_platoon(platoon_status,tl_id,ref_v,eta_to_light,distances=distances)

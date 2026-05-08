@@ -43,6 +43,7 @@ import csv
 from datetime import datetime
 import utils
 import yaml
+from collections import deque
 
 
 def get_waypoints(waypoints_list, N, vehicle_x, vehicle_y, vehicle_psi, current_wp_idx):
@@ -54,7 +55,9 @@ def get_waypoints(waypoints_list, N, vehicle_x, vehicle_y, vehicle_psi, current_
     closest_idx = current_wp_idx
 
     # Find the closest waypoint ahead of the vehicle
-    for idx in range(current_wp_idx, num_waypoints):
+    # Robust window: search ahead but allow for some drift/slip
+    search_end_idx = min(current_wp_idx + 150, num_waypoints)
+    for idx in range(current_wp_idx, search_end_idx):
         wp = waypoints_list[idx]
         dx = wp['x'] - vehicle_x
         dy = wp['y'] - vehicle_y
@@ -226,6 +229,14 @@ class MPCAgent(object):
         self.waypoints = utils.read_waypoints_from_csv("config/route.csv")
         self.waypoint_locations = [carla.Location(x=wp['x'], y=wp['y'], z=wp['z']) for wp in self.waypoints]
         self.current_wp_idx = 0  # Initialize current waypoint index
+        
+        # Longitudinal Latency Simulation Attributes
+        self.latency_ms = 100  # 100ms latency
+        self.latency_ticks = int(self.latency_ms / (self.dt * 1000))
+        self.longitudinal_buffer = deque()
+        self.last_applied_throttle = 0.0
+        self.last_applied_brake = 0.0
+        self.last_applied_a = 0.0
 
     def get_vehicle_state(self):
         """
@@ -286,12 +297,18 @@ class MPCAgent(object):
         calculated_acceleration = (current_velocity - self.previous_velocity) / self.dt
         self.previous_velocity = current_velocity
 
-        # try:
-        #     front_vehicle_status = self.traffic_manager.get_front_vehicle_status(self.vehicle)
-        #     print(f"Front Vehicle Distance: {front_vehicle_status['distance']:.2f}, Speed: {front_vehicle_status['speed']:.2f} km/h")
-        # except TypeError:
-        #     front_vehicle_status = {'distance': 11, 'speed': 0.0}
-        #     print("No front vehicle detected.")
+        try:
+            front_vehicle_status = self.traffic_manager.get_front_vehicle_status(self.vehicle)
+            if front_vehicle_status:
+                print(f"Front Vehicle Distance: {front_vehicle_status['distance']:.2f}, Speed: {front_vehicle_status['speed']:.2f} m/s")
+                # If front vehicle is very close, force a lower reference velocity
+                if front_vehicle_status['distance'] < 15.0:
+                    self.ref_v = min(self.ref_v, front_vehicle_status['speed'])
+                    if front_vehicle_status['distance'] < 8.0:
+                        self.ref_v = 0.0
+        except Exception as e:
+            # print(f"Front vehicle detection error: {e}")
+            pass
 
         vehicle_transform = self.vehicle.get_transform()
         vehicle_rotation = vehicle_transform.rotation
@@ -350,27 +367,62 @@ class MPCAgent(object):
         current_state = np.array([pred_x, pred_y, pred_psi, pred_v, pred_cte, pred_epsi])
         print("Min Acceleration: ", min(calculated_acceleration, self.prev_a))
         # Solve MPC to obtain the optimal delta and acceleration
-        optimal_delta, optimal_a, mpc_x, mpc_y = self.mpc_controller.solve(current_state, coeffs, self.prev_delta, self.prev_a, self.ref_v)
+        result = self.mpc_controller.solve(current_state, coeffs, self.prev_delta, self.prev_a, self.ref_v)
 
-        # Update for next timestep
-        self.prev_delta = optimal_delta
+        if result is not None:
+            optimal_delta, optimal_a, mpc_x, mpc_y = result
+            # Update for next timestep
+            self.prev_delta = optimal_delta
+            self.prev_a = optimal_a[0]
+            optimal_a_val = optimal_a[0]
+        else:
+            print("[MPC Agent] WARNING: Solver failed. Using fallback (previous control).")
+            optimal_delta = self.prev_delta
+            optimal_a_val = self.prev_a
+            # Use current velocity as a safe fallback if previous acceleration was zero
+            if abs(optimal_a_val) < 0.01 and current_velocity < 0.1:
+                 optimal_a_val = 0.0
+
         print("Optimal Delta: ", optimal_delta)
-        self.prev_a = optimal_a[0]
 
         # Map acceleration to throttle and brake
-        throttle_cmd, brake_cmd = map_acceleration_to_throttle_brake(optimal_a[0], 
+        throttle_cmd, brake_cmd = map_acceleration_to_throttle_brake(optimal_a_val, 
                                                                      self.mpc_controller.a_max, 
                                                                      -self.mpc_controller.a_max, 
                                                                      should_brake=False)
         
-        # Compute the steering command
+        # --- Longitudinal Latency Logic ---
+        self.longitudinal_buffer.append((throttle_cmd, brake_cmd, optimal_a_val))
+        
+        if len(self.longitudinal_buffer) > self.latency_ticks:
+            applied_throttle, applied_brake, applied_a = self.longitudinal_buffer.popleft()
+        else:
+            applied_throttle = self.last_applied_throttle
+            applied_brake = self.last_applied_brake
+            applied_a = self.last_applied_a
+            
+        self.last_applied_throttle = applied_throttle
+        self.last_applied_brake = applied_brake
+        self.last_applied_a = applied_a
+
+        # Compute the steering command (Immediate)
         steering_cmd = float(optimal_delta / math.radians(25))  # Normalize steering
+        
         # Create and inject the control command
         control = carla.VehicleControl()
         control.steer = np.clip(steering_cmd, -1.0, 1.0)  # Clamp steering to [-1, 1]
-        control.throttle = np.clip(throttle_cmd, 0.0, 0.6)  # Clamp throttle to [0, 1]
-        control.brake = np.clip(brake_cmd, 0.0, 0.28)  # Clamp brake to [0, 1]
-        print("[MPC Agent] Throttle Command: ", control.throttle)
-        print("[MPC Agent] Brake Command: ", control.brake)
+        control.throttle = np.clip(applied_throttle, 0.0, 0.6)  # Clamp throttle to [0, 1]
+        control.brake = np.clip(applied_brake, 0.0, 0.28)  # Clamp brake to [0, 1]
+        
+        print(f"[MPC Agent] Applied Control: Steer(Immediate)={control.steer:.2f}, "
+              f"Throttle(Delayed {self.latency_ms}ms)={control.throttle:.2f}, "
+              f"Brake(Delayed {self.latency_ms}ms)={control.brake:.2f}")
+        
+        # Check for route end (reached the last few waypoints)
+        route_end = False
+        if self.current_wp_idx >= len(self.waypoints) - 15:
+            print("[MPC Agent] Reached the end of the route.")
+            route_end = True
+
         self.vehicle.apply_control(control)
-        return optimal_a[0], False, self.ref_v
+        return applied_a, route_end, self.ref_v
