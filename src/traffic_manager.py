@@ -89,22 +89,63 @@ class VehicleTrafficManager:
 
 
     def get_front_vehicle_status(self, ego_vehicle):
-        """Retrieve the status of the front vehicle, including distance and velocity."""
+        """Retrieve the status of the closest front vehicle, including distance and velocity."""
+        ego_location = ego_vehicle.get_location()
+        ego_transform = ego_vehicle.get_transform()
+        ego_forward = ego_transform.get_forward_vector()
+        
+        best_vehicle = None
+        min_distance = float('inf')
+        
+        # Collect all potential obstacles
+        potential_obstacles = []
+        for pm in self.platoon_managers:
+            potential_obstacles.extend(pm.vehicles)
+        potential_obstacles.extend(self.traffic_vehicles)
         if self.front_vehicle and self.front_vehicle.is_alive:
-            front_vehicle_location = self.front_vehicle.get_location()
-            front_vehicle_velocity = self.front_vehicle.get_velocity()
-            speed = math.sqrt(front_vehicle_velocity.x**2 + front_vehicle_velocity.y**2 + front_vehicle_velocity.z**2)
-            distance = ego_vehicle.get_location().distance(front_vehicle_location)
-              # Log to CSV
+            potential_obstacles.append(self.front_vehicle)
+            
+        for vehicle in potential_obstacles:
+            if vehicle.id == ego_vehicle.id or not vehicle.is_alive:
+                continue
+                
+            v_location = vehicle.get_location()
+            distance = ego_location.distance(v_location)
+            
+            # Check within 60 meters
+            if distance < 60.0:
+                # Vector from ego to other vehicle
+                to_vec = v_location - ego_location
+                
+                # Check if it's in front (dot product with forward vector)
+                dot = ego_forward.x * to_vec.x + ego_forward.y * to_vec.y
+                
+                if dot > 0: # In front semicircle
+                    # Normalize distance for angle calculation
+                    mag = math.sqrt(to_vec.x**2 + to_vec.y**2)
+                    if mag > 0:
+                        cos_theta = dot / mag
+                        # Allow for some width (approx. 20 degrees cone)
+                        if cos_theta > 0.94: # cos(20 deg) approx 0.94
+                            if distance < min_distance:
+                                min_distance = distance
+                                best_vehicle = vehicle
+                                
+        if best_vehicle:
+            v_velocity = best_vehicle.get_velocity()
+            speed = math.sqrt(v_velocity.x**2 + v_velocity.y**2 + v_velocity.z**2)
+            
+            # Log to CSV if it's the main front vehicle
             csv_file = self.csv_files.get('front_vehicle')
             if csv_file:
                 writer = csv.writer(csv_file)
                 timestamp = self.world.get_snapshot().timestamp.elapsed_seconds
-                writer.writerow([timestamp, speed, distance])
+                writer.writerow([timestamp, speed, min_distance])
+                
             return {
-                'location': front_vehicle_location,
+                'location': best_vehicle.get_location(),
                 'speed': speed,
-                'distance': distance
+                'distance': min_distance
             }
         return None
     
@@ -278,7 +319,9 @@ class VehicleTrafficManager:
                 vehicle.apply_control(control)
             if mpc_agent:
                 ego_agent.traffic_manager = self
-                optimal_a, route_end,ref_v_mpc = ego_agent.on_tick(ref_v,False)
+                # Check for red lights ahead
+                stop_for_light, _ = self.traffic_light_manager.is_red_light_ahead(vehicle.get_location())
+                optimal_a, route_end, ref_v_mpc = ego_agent.on_tick(ref_v, stop_for_light)
                 mpc_agent = False
             platoon_manager.update_platoon(platoon_status,tl_id,ref_v,eta_to_light,distances=distances)
             if route_end:

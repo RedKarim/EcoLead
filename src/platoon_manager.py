@@ -33,6 +33,7 @@
 #
 # ---------------------------------------------------------------------
 
+import math
 from platoon_messages import PCM, PAM
 
 class PlatoonManager:
@@ -51,11 +52,23 @@ class PlatoonManager:
         self.pcms = [PCM(vehicle_id=vehicle.id, desired_acceleration=0.0, desired_spacing=10.0,
                         platoon_id=self.platoon_id, position_in_platoon=idx, target_speed=0.0, distance_to_front=10)
                      for idx, vehicle in enumerate(self.vehicles)]
+        # Get initial speed for PAM
+        leader_vehicle = None
+        for v in self.vehicles:
+            if v.id == self.leader_id:
+                leader_vehicle = v
+                break
+        
+        initial_speed = 0.0
+        if leader_vehicle:
+            v_vel = leader_vehicle.get_velocity()
+            initial_speed = math.sqrt(v_vel.x**2 + v_vel.y**2 + v_vel.z**2)
+
         self.pam = PAM(
             leader_id=self.leader_id,
             platoon_id=self.platoon_id,
             platoon_size=len(self.vehicles),
-            platoon_speed=0.0,
+            platoon_speed=initial_speed,
             vehicle_ids=[v.id for v in self.vehicles],
             platoon_position=(0,0),
             eta_to_light=0,

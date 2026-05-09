@@ -136,7 +136,7 @@ def map_acceleration_to_throttle_brake(a_desired, a_max, a_min, should_brake=Fal
             throttle = np.clip(a_desired / a_max, 0.0, 1)
             brake = 0.0
         elif a_desired < 0:
-            print("Brake applied")
+            # print("Brake applied")
             throttle = 0.0
             brake = np.clip(-a_desired / abs(a_min), 0.0,1)
         else:
@@ -231,7 +231,7 @@ class MPCAgent(object):
         self.current_wp_idx = 0  # Initialize current waypoint index
         
         # Longitudinal Latency Simulation Attributes
-        self.latency_ms = 100  # 100ms latency
+        self.latency_ms = 300  # 100ms latency
         self.latency_ticks = int(self.latency_ms / (self.dt * 1000))
         self.longitudinal_buffer = deque()
         self.last_applied_throttle = 0.0
